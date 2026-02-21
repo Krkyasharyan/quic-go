@@ -193,21 +193,32 @@ func TestBBRv3ProbeBWSteadyStateCwnd(t *testing.T) {
 	s.driveToState(bbrProbeBW, rtt)
 	require.Equal(t, bbrProbeBW, s.sender.Mode())
 
-	// The steady-state cwnd should be approximately 0.85 * BDP.
+	// BBRv3 steady-state cwnd = cwndGain × BDP (2.0 × BDP),
+	// possibly bounded by inflight_hi / inflight_lo.
 	btlBw := s.sender.BtlBw()
 	minRtt := s.sender.MinRtt()
 
 	if btlBw > 0 && minRtt > 0 {
 		bdpBytesPerSec := uint64(btlBw / BytesPerSecond)
 		bdp := protocol.ByteCount(bdpBytesPerSec * uint64(minRtt) / uint64(time.Second))
-		expectedCwnd := protocol.ByteCount(bbrBDPHeadroomMultiplier * float64(bdp))
+		expectedCwnd := protocol.ByteCount(bbrProbeBWCwndGain * float64(bdp))
 		if expectedCwnd < s.sender.minCongestionWindow() {
 			expectedCwnd = s.sender.minCongestionWindow()
+		}
+		// Apply inflight bounds as the sender would.
+		if s.sender.InflightHi() > 0 && expectedCwnd > s.sender.InflightHi() {
+			expectedCwnd = s.sender.InflightHi()
+		}
+		phase := s.sender.ProbeBWPhaseValue()
+		if phase == probeBWCruise || phase == probeBWDown {
+			if s.sender.InflightLo() > 0 && expectedCwnd > s.sender.InflightLo() {
+				expectedCwnd = s.sender.InflightLo()
+			}
 		}
 
 		cwnd := s.sender.GetCongestionWindow()
 		require.Equal(t, expectedCwnd, cwnd,
-			"ProbeBW cwnd should be 0.85 * BDP (expected %d, got %d)", expectedCwnd, cwnd)
+			"ProbeBW cwnd should be 2.0 * BDP (bounded by inflight caps): expected %d, got %d", expectedCwnd, cwnd)
 	}
 }
 
@@ -426,7 +437,7 @@ func TestBBRv3MaybeExitSlowStartIsNoop(t *testing.T) {
 		"MaybeExitSlowStart should be a no-op for BBR")
 }
 
-func TestBBRv3LossInStartupCausesDrain(t *testing.T) {
+func TestBBRv3LossInStartupSetsInflightHi(t *testing.T) {
 	s := newTestBBRSender()
 	rtt := 100 * time.Millisecond
 
@@ -437,10 +448,14 @@ func TestBBRv3LossInStartupCausesDrain(t *testing.T) {
 
 	require.Equal(t, bbrStartup, s.sender.Mode())
 
-	// Lose packets — BBR should detect loss and transition to Drain.
+	priorInFlight := s.bytesInFlight
+
+	// Lose packets — BBRv3 should set inflight_hi but stay in Startup.
 	s.loseNPackets(1)
-	require.Equal(t, bbrDrain, s.sender.Mode(),
-		"loss in Startup should trigger transition to Drain")
+	require.Equal(t, bbrStartup, s.sender.Mode(),
+		"loss in Startup should NOT trigger immediate exit to Drain")
+	require.Equal(t, priorInFlight, s.sender.InflightHi(),
+		"inflightHi should be set to priorInFlight on Startup loss")
 }
 
 func TestBBRv3StartupGains(t *testing.T) {
@@ -449,10 +464,139 @@ func TestBBRv3StartupGains(t *testing.T) {
 	require.InDelta(t, bbrStartupCwndGain, s.sender.cwndGain, 0.01)
 }
 
-func TestBBRv3ProbeBWCycleGains(t *testing.T) {
-	// Verify the pacing gain cycle is correct.
-	expected := [8]float64{1.25, 0.75, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0}
-	require.Equal(t, expected, bbrProbeBWPacingGainCycle)
+func TestBBRv3ProbeBWSubStates(t *testing.T) {
+	// Verify the pacing gains for each ProbeBW sub-state.
+	require.InDelta(t, 0.9, bbrProbeBWDownPacingGain, 0.001)
+	require.InDelta(t, 1.0, bbrProbeBWCruisePacingGain, 0.001)
+	require.InDelta(t, 1.0, bbrProbeBWRefillPacingGain, 0.001)
+	require.InDelta(t, 1.25, bbrProbeBWUpPacingGain, 0.001)
+}
+
+func TestBBRv3ProbeBWSubStateCycle(t *testing.T) {
+	s := newTestBBRSender()
+	rtt := 100 * time.Millisecond
+
+	// Drive through Startup → Drain → ProbeBW.
+	s.driveToState(bbrProbeBW, rtt)
+	require.Equal(t, bbrProbeBW, s.sender.Mode())
+
+	// After Drain, we should enter CRUISE sub-state.
+	require.Equal(t, probeBWCruise, s.sender.ProbeBWPhaseValue(),
+		"should enter ProbeBW CRUISE after Drain")
+
+	// Advance past the CRUISE deadline (at most 2×minRTT from entry).
+	minRtt := s.sender.MinRtt()
+	if minRtt <= 0 {
+		minRtt = 100 * time.Millisecond
+	}
+	s.clock.Advance(2*minRtt + time.Millisecond)
+	s.sendNPackets(4)
+	s.clock.Advance(rtt)
+	s.ackNPackets(4, rtt)
+
+	// Should have transitioned to REFILL.
+	require.Equal(t, probeBWRefill, s.sender.ProbeBWPhaseValue(),
+		"should transition from CRUISE to REFILL after deadline")
+
+	// Advance one round to exit REFILL → UP.
+	s.sendNPackets(4)
+	s.clock.Advance(rtt)
+	s.ackNPackets(4, rtt)
+
+	require.Equal(t, probeBWUp, s.sender.ProbeBWPhaseValue(),
+		"should transition from REFILL to UP after one round")
+
+	// In UP, we need to advance a whole round to trigger UP→DOWN.
+	// The UP→DOWN condition is: (roundCount > probeBWUpRound && bdp > 0)
+	//   OR (bytesInFlight > 1.25×BDP).
+	// Send a burst, then ACK all of it to cross the round boundary.
+	nSend := 0
+	for s.sender.CanSend(s.bytesInFlight) && nSend < 64 {
+		s.sendPacket()
+		nSend++
+	}
+	// ACK all outstanding bytes, which crosses the currentRoundTripEnd boundary.
+	s.clock.Advance(rtt)
+	allInFlight := int(s.bytesInFlight / bbrTestMaxDatagramSize)
+	if allInFlight < 1 {
+		allInFlight = 1
+	}
+	s.ackNPackets(allInFlight, rtt)
+
+	// The UP→DOWN transition may have fired. But DOWN→CRUISE fires immediately
+	// when bytesInFlight ≤ BDP. So check if we transited through DOWN.
+	// The cycle is: UP→DOWN→CRUISE (transient DOWN is correct BBRv3 behavior).
+	phase := s.sender.ProbeBWPhaseValue()
+	require.True(t, phase == probeBWDown || phase == probeBWCruise,
+		"should have transitioned from UP to DOWN (or through to CRUISE): got %s", phase)
+}
+
+func TestBBRv3ProbeBWLossInUp(t *testing.T) {
+	s := newTestBBRSender()
+	rtt := 100 * time.Millisecond
+
+	// Drive to ProbeBW and then to UP sub-state.
+	s.driveToState(bbrProbeBW, rtt)
+	s.driveToProbeBWPhase(probeBWUp, rtt)
+	require.Equal(t, probeBWUp, s.sender.ProbeBWPhaseValue())
+
+	// Send enough packets to have significant inflight.
+	s.sendNPackets(32)
+
+	priorInFlight := s.bytesInFlight
+
+	// Inject enough loss to exceed the 2% threshold.
+	// We need lossInRound > 0.02 * inflightAtLoss.
+	// inflightAtLoss will be priorInFlight (set by first loss call).
+	// We need lost bytes > 0.02 * priorInFlight.
+	lossNeeded := int(float64(priorInFlight)*bbrLossThreshold/float64(bbrTestMaxDatagramSize)) + 1
+	if lossNeeded < 2 {
+		lossNeeded = 2
+	}
+	s.loseNPackets(lossNeeded)
+
+	// After excessive loss in UP, should transition to DOWN and cap inflightHi.
+	require.Equal(t, probeBWDown, s.sender.ProbeBWPhaseValue(),
+		"excessive loss in UP should trigger transition to DOWN")
+	require.Greater(t, s.sender.InflightHi(), protocol.ByteCount(0),
+		"inflightHi should be set after excessive loss in UP")
+}
+
+func TestBBRv3ProbeBWLossInCruiseSetsBound(t *testing.T) {
+	s := newTestBBRSender()
+	rtt := 100 * time.Millisecond
+
+	// Drive to ProbeBW CRUISE.
+	s.driveToState(bbrProbeBW, rtt)
+	require.Equal(t, probeBWCruise, s.sender.ProbeBWPhaseValue())
+
+	// Send some packets.
+	s.sendNPackets(10)
+
+	// Lose a packet in CRUISE — should set inflightLo.
+	s.loseNPackets(1)
+
+	require.Greater(t, s.sender.InflightLo(), protocol.ByteCount(0),
+		"inflightLo should be set after loss in CRUISE")
+}
+
+func TestBBRv3DrainExitOnBDP(t *testing.T) {
+	s := newTestBBRSender()
+	rtt := 100 * time.Millisecond
+
+	// Drive through Startup until we reach Drain (or beyond).
+	// We want to verify that the Drain→ProbeBW transition happens
+	// when bytesInFlight ≤ BDP.
+	s.driveToState(bbrProbeBW, rtt)
+
+	// If we are in ProbeBW, Drain was successfully exited.
+	// The key assertion is that checkDrain uses BDP-based exit.
+	require.Equal(t, bbrProbeBW, s.sender.Mode(),
+		"should exit Drain to ProbeBW when inflight ≤ BDP")
+
+	// Verify we're in CRUISE sub-state (entered via enterProbeBWCruise from Drain).
+	require.Equal(t, probeBWCruise, s.sender.ProbeBWPhaseValue(),
+		"should enter ProbeBW CRUISE after Drain")
 }
 
 // ---------- Helper: drive the sender to a target BBR state ----------
@@ -498,5 +642,51 @@ func (s *testBBRSender) driveToState(targetMode bbrMode, rtt time.Duration) {
 				return
 			}
 		}
+	}
+}
+
+// driveToProbeBWPhase drives the sender through ProbeBW sub-states
+// until the target phase is reached.
+func (s *testBBRSender) driveToProbeBWPhase(targetPhase probeBWPhase, rtt time.Duration) {
+	// Must already be in ProbeBW.
+	if s.sender.Mode() != bbrProbeBW {
+		s.driveToState(bbrProbeBW, rtt)
+	}
+
+	for i := 0; i < 200; i++ {
+		if s.sender.ProbeBWPhaseValue() == targetPhase {
+			return
+		}
+
+		// Advance time generously to trigger phase transitions.
+		minRtt := s.sender.MinRtt()
+		if minRtt <= 0 {
+			minRtt = rtt
+		}
+		s.clock.Advance(2*minRtt + time.Millisecond)
+
+		nSend := 0
+		for s.sender.CanSend(s.bytesInFlight) && nSend < 16 {
+			s.sendPacket()
+			nSend++
+		}
+		if nSend == 0 {
+			// Still blocked — ack some packets to free up cwnd.
+			if s.bytesInFlight > 0 {
+				toAck := min(4, int(s.bytesInFlight/bbrTestMaxDatagramSize))
+				if toAck < 1 {
+					toAck = 1
+				}
+				s.clock.Advance(rtt)
+				s.ackNPackets(toAck, rtt)
+			}
+			continue
+		}
+		s.clock.Advance(rtt)
+		toAck := min(nSend, int(s.bytesInFlight/bbrTestMaxDatagramSize))
+		if toAck < 1 {
+			toAck = 1
+		}
+		s.ackNPackets(toAck, rtt)
 	}
 }

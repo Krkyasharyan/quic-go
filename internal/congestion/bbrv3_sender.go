@@ -2,6 +2,7 @@ package congestion
 
 import (
 	"fmt"
+	"math/rand"
 	"time"
 
 	"github.com/quic-go/quic-go/internal/monotime"
@@ -11,14 +12,14 @@ import (
 	"github.com/quic-go/quic-go/qlogwriter"
 )
 
-// ---------- BBR Mode (State Machine) ----------
+// ---------- BBR Mode (Top-Level State Machine) ----------
 
 type bbrMode int
 
 const (
 	bbrStartup  bbrMode = iota // Exponentially probe bandwidth.
 	bbrDrain                   // Drain the queue created during Startup.
-	bbrProbeBW                 // Steady-state: cycle pacing gain to probe bandwidth.
+	bbrProbeBW                 // Steady-state: cycle through sub-phases to probe bandwidth.
 	bbrProbeRTT                // Reduce cwnd to re-measure min RTT.
 )
 
@@ -37,6 +38,32 @@ func (m bbrMode) String() string {
 	}
 }
 
+// ---------- ProbeBW Sub-States (BBRv3) ----------
+
+type probeBWPhase int
+
+const (
+	probeBWDown   probeBWPhase = iota // Drain queue after a bandwidth probe.
+	probeBWCruise                     // Maintain stable throughput at BDP.
+	probeBWRefill                     // Refill the pipe before probing up.
+	probeBWUp                         // Actively probe for more bandwidth.
+)
+
+func (p probeBWPhase) String() string {
+	switch p {
+	case probeBWDown:
+		return "DOWN"
+	case probeBWCruise:
+		return "CRUISE"
+	case probeBWRefill:
+		return "REFILL"
+	case probeBWUp:
+		return "UP"
+	default:
+		return "UNKNOWN"
+	}
+}
+
 // ---------- Constants ----------
 
 const (
@@ -44,16 +71,17 @@ const (
 	bbrStartupPacingGain = 2.89
 	bbrStartupCwndGain   = 2.89
 
-	// Drain pacing gain: 1/startup_gain.
+	// Drain pacing gain: 1/startup_gain ≈ 0.346.
 	bbrDrainPacingGain = 1.0 / bbrStartupPacingGain
 
-	// ProbeBW cwnd gain — we use 2.0 as the multiplier before the 0.85 headroom
-	// factor is applied in targetCwnd().
+	// ProbeBW cwnd gain: 2.0 (headroom for probing phases).
 	bbrProbeBWCwndGain = 2.0
 
-	// The 0.85 BDP headroom multiplier for the steady-state (ProbeBW) cwnd.
-	// This prevents router buffer overflow on high-RTT paths (e.g. RU↔EU).
-	bbrBDPHeadroomMultiplier = 0.85
+	// ProbeBW sub-state pacing gains.
+	bbrProbeBWDownPacingGain   = 0.9
+	bbrProbeBWCruisePacingGain = 1.0
+	bbrProbeBWRefillPacingGain = 1.0
+	bbrProbeBWUpPacingGain     = 1.25
 
 	// Windowed max-bandwidth filter: 10 round-trips.
 	bbrBandwidthWindowSize = 10
@@ -76,6 +104,9 @@ const (
 	// Threshold for bandwidth growth in Startup: 25%.
 	bbrStartupFullBandwidthThreshold = 1.25
 
+	// BBRv3 loss threshold: if loss rate exceeds 2% of inflight, react.
+	bbrLossThreshold = 0.02
+
 	// Pacing "death zone": QUIC critical jitter zone is 26–35 pps.
 	bbrDeathZoneLowPPS  = 26
 	bbrDeathZoneHighPPS = 35
@@ -84,9 +115,6 @@ const (
 	// Default MTU for QUIC.
 	bbrDefaultMTU = 1200
 )
-
-// ProbeBW pacing gain cycle: [1.25, 0.75, 1, 1, 1, 1, 1, 1].
-var bbrProbeBWPacingGainCycle = [8]float64{1.25, 0.75, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0}
 
 // ---------- bbrv3Sender ----------
 
@@ -103,6 +131,18 @@ type bbrv3Sender struct {
 
 	// --- BBR State Machine ---
 	mode bbrMode
+
+	// --- ProbeBW Sub-State Machine (BBRv3) ---
+	probeBWPhase          probeBWPhase
+	probeBWPhaseStart     monotime.Time // timestamp when we entered the current sub-phase
+	probeBWCruiseDeadline monotime.Time // randomized CRUISE→REFILL transition time
+	probeBWRefillRound    int64         // round count at which REFILL was entered
+	probeBWUpRound        int64         // round count at which UP started
+
+	// --- BBRv3 Inflight / Bandwidth Bounds ---
+	inflightLo protocol.ByteCount // lower inflight bound (set during loss in CRUISE/DOWN)
+	inflightHi protocol.ByteCount // upper inflight bound (set during ProbeBW_UP / Startup loss)
+	bwLo       Bandwidth          // lower bandwidth bound
 
 	// --- Bandwidth Estimation ---
 	maxBwFilter *windowedFilter // windowed max over bbrBandwidthWindowSize rounds
@@ -124,9 +164,9 @@ type bbrv3Sender struct {
 	fullBandwidthCount   int       // consecutive rounds without ≥25% BW growth
 	startupFullBWReached bool
 
-	// --- ProbeBW ---
-	cycleIndex int
-	cycleStart monotime.Time
+	// --- Loss tracking for current round ---
+	lossInRound    protocol.ByteCount // bytes lost in current round
+	inflightAtLoss protocol.ByteCount // bytes in flight when loss was detected
 
 	// --- ProbeRTT ---
 	probeRttDoneAt    monotime.Time
@@ -263,7 +303,7 @@ func (b *bbrv3Sender) OnPacketAcked(
 	case bbrDrain:
 		b.checkDrain(priorInFlight)
 	case bbrProbeBW:
-		b.updateProbeBWCyclePhase(eventTime, priorInFlight)
+		b.updateProbeBWPhase(eventTime, priorInFlight)
 		b.maybeEnterProbeRTT(eventTime)
 	case bbrProbeRTT:
 		b.handleProbeRTT(eventTime, priorInFlight)
@@ -282,30 +322,56 @@ func (b *bbrv3Sender) OnCongestionEvent(
 	b.connStats.PacketsLost.Add(1)
 	b.connStats.BytesLost.Add(uint64(lostBytes))
 
+	// Track loss in this round for BBRv3 excessive-loss detection.
+	b.lossInRound += lostBytes
+	if b.inflightAtLoss == 0 || priorInFlight > b.inflightAtLoss {
+		b.inflightAtLoss = priorInFlight
+	}
+
 	// Treat losses within the same cutback window as a single event.
 	if packetNumber <= b.largestSentAtLastCutback {
 		return
 	}
-
-	// In Startup, if we see losses, consider transitioning.
-	// BBRv3 uses loss as an additional signal in Startup.
-	if b.mode == bbrStartup {
-		// Mark bandwidth as fully probed if we see significant loss.
-		b.startupFullBWReached = true
-		b.enterDrain()
-	}
-
 	b.largestSentAtLastCutback = b.largestSentPacketNumber
 
-	// In ProbeBW/Drain, cut cwnd by beta=0.7 on loss (conservative).
-	if b.mode == bbrProbeBW || b.mode == bbrDrain {
-		b.congestionWindow = protocol.ByteCount(float64(b.congestionWindow) * 0.7)
-		if b.congestionWindow < b.minCongestionWindow() {
-			b.congestionWindow = b.minCongestionWindow()
-		}
+	switch b.mode {
+	case bbrStartup:
+		// BBRv3: loss in Startup sets inflight_hi as a cap, but does NOT
+		// trigger immediate exit. Startup exit remains bandwidth-plateau-only.
+		b.inflightHi = priorInFlight
+	case bbrProbeBW:
+		b.handleProbeBWLoss(priorInFlight)
+	case bbrDrain:
+		// No cwnd cut in Drain — we are already draining.
 	}
 
 	b.maybeQlogStateChange(qlog.CongestionStateRecovery)
+}
+
+// handleProbeBWLoss implements BBRv3 loss response during ProbeBW.
+func (b *bbrv3Sender) handleProbeBWLoss(priorInFlight protocol.ByteCount) {
+	switch b.probeBWPhase {
+	case probeBWUp:
+		// Excessive loss during UP: cap inflight_hi and transition to DOWN.
+		if b.isExcessiveLoss() {
+			b.inflightHi = priorInFlight
+			b.enterProbeBWDown(b.clock.Now())
+		}
+	case probeBWCruise, probeBWDown:
+		// During CRUISE/DOWN, tighten the lower bound on loss.
+		if b.inflightLo == 0 || priorInFlight < b.inflightLo {
+			b.inflightLo = priorInFlight
+		}
+	}
+}
+
+// isExcessiveLoss returns true if the loss in the current round exceeds
+// the BBRv3 loss threshold (2% of inflight at loss detection).
+func (b *bbrv3Sender) isExcessiveLoss() bool {
+	if b.inflightAtLoss == 0 {
+		return false
+	}
+	return float64(b.lossInRound) > bbrLossThreshold*float64(b.inflightAtLoss)
 }
 
 // OnRetransmissionTimeout is called on a retransmission timeout.
@@ -447,6 +513,9 @@ func (b *bbrv3Sender) updateRound(lastAckedPacket protocol.PacketNumber) {
 		b.roundCount++
 		b.roundStart = true
 		b.currentRoundTripEnd = b.largestSentPacketNumber
+		// Reset per-round loss tracking at the start of each round.
+		b.lossInRound = 0
+		b.inflightAtLoss = 0
 	} else {
 		b.roundStart = false
 	}
@@ -494,40 +563,107 @@ func (b *bbrv3Sender) enterDrain() {
 // --- Drain ---
 
 func (b *bbrv3Sender) checkDrain(bytesInFlight protocol.ByteCount) {
-	if bytesInFlight <= b.targetCwnd() {
-		b.enterProbeBW(b.clock.Now())
+	// BBRv3: Drain exits when bytes in flight ≤ BDP.
+	bdp := b.bdp()
+	if bdp == 0 {
+		bdp = b.targetCwnd() // fallback when BDP can't be computed
+	}
+	if bytesInFlight <= bdp {
+		b.enterProbeBWCruise(b.clock.Now())
 	}
 }
 
-// --- ProbeBW ---
+// --- ProbeBW (BBRv3 sub-states: DOWN → CRUISE → REFILL → UP → DOWN ...) ---
 
-func (b *bbrv3Sender) enterProbeBW(now monotime.Time) {
+func (b *bbrv3Sender) enterProbeBWDown(now monotime.Time) {
 	b.mode = bbrProbeBW
-	b.cwndGain = bbrProbeBWCwndGain
-
-	// Start at a random-ish index (use round count mod 8, skip index 1 which is the drain phase).
-	b.cycleIndex = int(b.roundCount) % len(bbrProbeBWPacingGainCycle)
-	if b.cycleIndex == 1 {
-		b.cycleIndex = 0
-	}
-	b.pacingGain = bbrProbeBWPacingGainCycle[b.cycleIndex]
-	b.cycleStart = now
+	b.probeBWPhase = probeBWDown
+	b.probeBWPhaseStart = now
+	b.pacingGain = bbrProbeBWDownPacingGain // 0.9
+	b.cwndGain = bbrProbeBWCwndGain         // 2.0
 	b.maybeQlogStateChange(qlog.CongestionStateCongestionAvoidance)
 }
 
-func (b *bbrv3Sender) updateProbeBWCyclePhase(eventTime monotime.Time, bytesInFlight protocol.ByteCount) {
-	// Advance to next phase when one min_rtt has elapsed.
-	cycleElapsed := eventTime.Sub(b.cycleStart)
+func (b *bbrv3Sender) enterProbeBWCruise(now monotime.Time) {
+	b.mode = bbrProbeBW
+	b.probeBWPhase = probeBWCruise
+	b.probeBWPhaseStart = now
+	b.pacingGain = bbrProbeBWCruisePacingGain // 1.0
+	b.cwndGain = bbrProbeBWCwndGain           // 2.0
+	// Set a randomized deadline for CRUISE: [minRTT, 2×minRTT] from now.
+	b.probeBWCruiseDeadline = now.Add(b.randomizedCruiseDuration())
+	b.maybeQlogStateChange(qlog.CongestionStateCongestionAvoidance)
+}
 
-	if cycleElapsed > b.minRtt {
-		b.advanceProbeBWCycle(eventTime)
+func (b *bbrv3Sender) enterProbeBWRefill(now monotime.Time) {
+	b.mode = bbrProbeBW
+	b.probeBWPhase = probeBWRefill
+	b.probeBWPhaseStart = now
+	b.pacingGain = bbrProbeBWRefillPacingGain // 1.0
+	b.cwndGain = bbrProbeBWCwndGain           // 2.0
+	// Clear lower bounds: REFILL starts fresh before probing up.
+	b.inflightLo = 0
+	b.bwLo = 0
+	// Record the round count; REFILL lasts exactly one round.
+	b.probeBWRefillRound = b.roundCount
+	b.maybeQlogStateChange(qlog.CongestionStateCongestionAvoidance)
+}
+
+func (b *bbrv3Sender) enterProbeBWUp(now monotime.Time) {
+	b.mode = bbrProbeBW
+	b.probeBWPhase = probeBWUp
+	b.probeBWPhaseStart = now
+	b.pacingGain = bbrProbeBWUpPacingGain // 1.25
+	b.cwndGain = bbrProbeBWCwndGain       // 2.0
+	b.probeBWUpRound = b.roundCount
+	b.maybeQlogStateChange(qlog.CongestionStateCongestionAvoidance)
+}
+
+// updateProbeBWPhase is called on each ACK while in ProbeBW mode.
+// It checks whether the current sub-phase should transition.
+func (b *bbrv3Sender) updateProbeBWPhase(eventTime monotime.Time, bytesInFlight protocol.ByteCount) {
+	switch b.probeBWPhase {
+	case probeBWDown:
+		// Exit DOWN when inflight ≤ BDP.
+		bdp := b.bdp()
+		if bdp > 0 && bytesInFlight <= bdp {
+			b.enterProbeBWCruise(eventTime)
+		}
+	case probeBWCruise:
+		// Exit CRUISE when the randomized timer fires.
+		if !b.probeBWCruiseDeadline.IsZero() && !eventTime.Before(b.probeBWCruiseDeadline) {
+			b.enterProbeBWRefill(eventTime)
+		}
+	case probeBWRefill:
+		// Exit REFILL after exactly one round has elapsed.
+		if b.roundCount > b.probeBWRefillRound {
+			b.enterProbeBWUp(eventTime)
+		}
+	case probeBWUp:
+		// Exit UP if: (a) bytesInFlight exceeds 1.25 × BDP, OR
+		// (b) a full round has elapsed.
+		bdp := b.bdp()
+		overshoot := bdp > 0 && bytesInFlight > protocol.ByteCount(float64(bdp)*bbrProbeBWUpPacingGain)
+		roundElapsed := b.roundCount > b.probeBWUpRound
+		if overshoot || (roundElapsed && bdp > 0) {
+			// If no excessive loss, raise inflight_hi to the current level.
+			if !b.isExcessiveLoss() && bytesInFlight > b.inflightHi {
+				b.inflightHi = bytesInFlight
+			}
+			b.enterProbeBWDown(eventTime)
+		}
 	}
 }
 
-func (b *bbrv3Sender) advanceProbeBWCycle(now monotime.Time) {
-	b.cycleIndex = (b.cycleIndex + 1) % len(bbrProbeBWPacingGainCycle)
-	b.cycleStart = now
-	b.pacingGain = bbrProbeBWPacingGainCycle[b.cycleIndex]
+// randomizedCruiseDuration returns a duration in [minRTT, 2×minRTT].
+func (b *bbrv3Sender) randomizedCruiseDuration() time.Duration {
+	minDur := b.minRtt
+	if minDur <= 0 {
+		minDur = 100 * time.Millisecond // fallback
+	}
+	// rand in [0, minDur]
+	jitter := time.Duration(rand.Int63n(int64(minDur) + 1))
+	return minDur + jitter
 }
 
 // --- ProbeRTT ---
@@ -588,29 +724,50 @@ func (b *bbrv3Sender) exitProbeRTT(eventTime monotime.Time) {
 	// Restore cwnd.
 	b.congestionWindow = max(b.priorCwnd, b.minCongestionWindow())
 
-	// Transition to ProbeBW.
-	b.enterProbeBW(eventTime)
+	// Transition to ProbeBW CRUISE (clean slate after RTT probe).
+	b.enterProbeBWCruise(eventTime)
 }
 
 // ---------- Cwnd Calculation ----------
 
-func (b *bbrv3Sender) targetCwnd() protocol.ByteCount {
+// bdp returns the current bandwidth-delay product in bytes.
+func (b *bbrv3Sender) bdp() protocol.ByteCount {
 	if b.btlBw == 0 || b.minRtt == 0 {
+		return 0
+	}
+	bdpBytesPerSec := uint64(b.btlBw / BytesPerSecond)
+	return protocol.ByteCount(bdpBytesPerSec * uint64(b.minRtt) / uint64(time.Second))
+}
+
+func (b *bbrv3Sender) targetCwnd() protocol.ByteCount {
+	bdp := b.bdp()
+	if bdp == 0 {
 		return b.congestionWindow
 	}
-
-	// BDP = btlBw (bytes/s) * minRtt (s)
-	bdpBytesPerSec := uint64(b.btlBw / BytesPerSecond)
-	bdp := protocol.ByteCount(bdpBytesPerSec * uint64(b.minRtt) / uint64(time.Second))
 
 	var target protocol.ByteCount
 	switch b.mode {
 	case bbrProbeBW:
-		// Habr Bufferbloat Mitigation: 0.85 × BDP.
-		target = protocol.ByteCount(bbrBDPHeadroomMultiplier * float64(bdp))
+		// BBRv3 ProbeBW: cwnd = cwndGain × BDP, bounded by inflight caps.
+		target = protocol.ByteCount(b.cwndGain * float64(bdp))
+		// Apply inflight_hi cap (limits overshoot from probing).
+		if b.inflightHi > 0 && target > b.inflightHi {
+			target = b.inflightHi
+		}
+		// Apply inflight_lo cap during CRUISE and DOWN (limits steady-state queue).
+		if b.probeBWPhase == probeBWCruise || b.probeBWPhase == probeBWDown {
+			if b.inflightLo > 0 && target > b.inflightLo {
+				target = b.inflightLo
+			}
+		}
 	default:
 		// Startup/Drain use cwndGain × BDP.
 		target = protocol.ByteCount(b.cwndGain * float64(bdp))
+	}
+
+	// Global inflight_hi cap (set by Startup loss or ProbeBW_UP).
+	if b.inflightHi > 0 && target > b.inflightHi {
+		target = b.inflightHi
 	}
 
 	// Floor: never below minimum cwnd.
@@ -682,4 +839,19 @@ func (b *bbrv3Sender) MinRtt() time.Duration {
 // SetDisableProbeRTT sets whether ProbeRTT is disabled.
 func (b *bbrv3Sender) SetDisableProbeRTT(disable bool) {
 	b.disableProbeRTT = disable
+}
+
+// ProbeBWPhaseValue returns the current ProbeBW sub-phase.
+func (b *bbrv3Sender) ProbeBWPhaseValue() probeBWPhase {
+	return b.probeBWPhase
+}
+
+// InflightHi returns the current upper inflight bound.
+func (b *bbrv3Sender) InflightHi() protocol.ByteCount {
+	return b.inflightHi
+}
+
+// InflightLo returns the current lower inflight bound.
+func (b *bbrv3Sender) InflightLo() protocol.ByteCount {
+	return b.inflightLo
 }
