@@ -69,7 +69,6 @@ func NewDeliveryRateEstimator() *DeliveryRateEstimator {
 func (e *DeliveryRateEstimator) OnPacketSent(
 	sentTime monotime.Time,
 	bytesInFlight protocol.ByteCount,
-	appLimited bool,
 ) PacketDeliveryState {
 	// If this is the first packet of a new flight (nothing in flight before),
 	// mark the start of the flight.
@@ -77,7 +76,6 @@ func (e *DeliveryRateEstimator) OnPacketSent(
 		e.firstSentTime = sentTime
 		e.deliveredTime = sentTime
 	}
-	e.appLimited = appLimited
 
 	return PacketDeliveryState{
 		Delivered:     e.delivered,

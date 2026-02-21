@@ -302,8 +302,15 @@ func (h *sentPacketHandler) SentPacket(
 	// Snapshot delivery-rate state into the packet for later rate estimation.
 	// bytesInFlight here reflects the state *before* this packet (we want to
 	// detect a new flight when nothing was in flight before this send).
-	appLimited := isAckEliciting && h.bytesInFlight < h.congestion.GetCongestionWindow()
-	ds := h.deliveryEstimator.OnPacketSent(t, h.bytesInFlight-size, appLimited)
+	//
+	// App-limited detection uses the persistent flag set by MarkAppLimited()
+	// (called from the send loop when there's no data to send with pipe not
+	// full). Clear the flag once the pipe fills — this matches Linux BBR's
+	// approach of clearing app-limited when bytesInFlight >= cwnd.
+	if isAckEliciting && h.bytesInFlight >= h.congestion.GetCongestionWindow() {
+		h.deliveryEstimator.SetAppLimited(false)
+	}
+	ds := h.deliveryEstimator.OnPacketSent(t, h.bytesInFlight-size)
 	p.deliveredAtSend = ds.Delivered
 	p.deliveredTimeAtSend = ds.DeliveredTime
 	p.firstSentTimeAtSend = ds.FirstSentTime
@@ -467,7 +474,14 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 				IsAppLimited:  p.isAppLimitedAtSend,
 			}
 			sample := h.deliveryEstimator.GenerateRateSample(pktState, p.SendTime, p.Length, rcvTime)
-			if sample.DeliveryRate > bestSample.DeliveryRate {
+			// Prefer non-app-limited samples over app-limited ones.
+			// Among samples of the same limitation status, prefer higher delivery rate.
+			// This prevents app-limited samples from crowding out real bottleneck measurements.
+			if bestSample.DeliveryRate == 0 {
+				bestSample = sample
+			} else if !sample.IsAppLimited && bestSample.IsAppLimited {
+				bestSample = sample
+			} else if sample.IsAppLimited == bestSample.IsAppLimited && sample.DeliveryRate > bestSample.DeliveryRate {
 				bestSample = sample
 			}
 		}
@@ -1066,6 +1080,16 @@ func (h *sentPacketHandler) TimeUntilSend() monotime.Time {
 
 func (h *sentPacketHandler) SetMaxDatagramSize(s protocol.ByteCount) {
 	h.congestion.SetMaxDatagramSize(s)
+}
+
+// MarkAppLimited is called when the send loop runs out of data to send
+// while the congestion window is not full. This persistently marks the
+// delivery rate estimator as app-limited so that subsequent packets are
+// correctly tagged.
+func (h *sentPacketHandler) MarkAppLimited() {
+	if h.bytesInFlight < h.congestion.GetCongestionWindow() {
+		h.deliveryEstimator.SetAppLimited(true)
+	}
 }
 
 func (h *sentPacketHandler) isAmplificationLimited() bool {

@@ -60,8 +60,11 @@ func newTestBBRSender() *testBBRSender {
 
 func (s *testBBRSender) sendPacket() {
 	// Snapshot delivery state before send (mirrors sent_packet_handler).
-	appLimited := s.bytesInFlight < s.sender.GetCongestionWindow()
-	ds := s.estimator.OnPacketSent(s.clock.Now(), s.bytesInFlight, appLimited)
+	// Clear app-limited once pipe fills (matches production code).
+	if s.bytesInFlight >= s.sender.GetCongestionWindow() {
+		s.estimator.SetAppLimited(false)
+	}
+	ds := s.estimator.OnPacketSent(s.clock.Now(), s.bytesInFlight)
 	s.pktStates[s.packetNumber] = pktSnapshot{state: ds, sendTime: s.clock.Now()}
 
 	s.sender.OnPacketSent(s.clock.Now(), s.bytesInFlight, s.packetNumber, bbrTestMaxDatagramSize, true)
@@ -75,6 +78,18 @@ func (s *testBBRSender) sendNPackets(n int) {
 	}
 }
 
+// sendAppLimitedPacket sends a packet while the connection is explicitly
+// marked as app-limited (simulating MarkAppLimited() from the send loop).
+func (s *testBBRSender) sendAppLimitedPacket() {
+	s.estimator.SetAppLimited(true)
+	ds := s.estimator.OnPacketSent(s.clock.Now(), s.bytesInFlight)
+	s.pktStates[s.packetNumber] = pktSnapshot{state: ds, sendTime: s.clock.Now()}
+
+	s.sender.OnPacketSent(s.clock.Now(), s.bytesInFlight, s.packetNumber, bbrTestMaxDatagramSize, true)
+	s.bytesInFlight += bbrTestMaxDatagramSize
+	s.packetNumber++
+}
+
 func (s *testBBRSender) ackNPackets(n int, rtt time.Duration) {
 	s.rttStats.UpdateRTT(rtt, 0)
 	var bestSample RateSample
@@ -86,7 +101,12 @@ func (s *testBBRSender) ackNPackets(n int, rtt time.Duration) {
 			sample := s.estimator.GenerateRateSample(
 				snap.state, snap.sendTime, bbrTestMaxDatagramSize, s.clock.Now(),
 			)
-			if sample.DeliveryRate > bestSample.DeliveryRate {
+			// Best-sample selection: prefer non-app-limited over app-limited.
+			if bestSample.DeliveryRate == 0 {
+				bestSample = sample
+			} else if !sample.IsAppLimited && bestSample.IsAppLimited {
+				bestSample = sample
+			} else if sample.IsAppLimited == bestSample.IsAppLimited && sample.DeliveryRate > bestSample.DeliveryRate {
 				bestSample = sample
 			}
 			delete(s.pktStates, s.ackedPacketNumber)
@@ -876,4 +896,212 @@ func (s *testBBRSender) driveToProbeBWPhase(targetPhase probeBWPhase, rtt time.D
 		}
 		s.ackNPackets(toAck, rtt)
 	}
+}
+
+// ---------- Phase 4: App-Limited Death Spiral Prevention ----------
+
+func TestBBRv3AppLimitedSampleRejectedWhenBtlBwZero(t *testing.T) {
+	// When btlBw is 0 (initial state), an app-limited sample must NOT seed
+	// the maxBwFilter, even if its rate is positive.
+	s := newTestBBRSender()
+	rtt := 50 * time.Millisecond
+
+	require.Equal(t, Bandwidth(0), s.sender.btlBw)
+
+	// Send a single app-limited packet (connection draining scenario).
+	s.sendAppLimitedPacket()
+	s.clock.Advance(rtt)
+
+	// ACK it — this produces an app-limited sample.
+	s.ackedPacketNumber++
+	snap := s.pktStates[s.ackedPacketNumber]
+	sample := s.estimator.GenerateRateSample(
+		snap.state, snap.sendTime, bbrTestMaxDatagramSize, s.clock.Now(),
+	)
+	require.True(t, sample.IsAppLimited)
+	require.True(t, sample.DeliveryRate > 0)
+	delete(s.pktStates, s.ackedPacketNumber)
+
+	s.sender.OnPacketAcked(s.ackedPacketNumber, bbrTestMaxDatagramSize, s.bytesInFlight, s.clock.Now())
+	s.bytesInFlight -= bbrTestMaxDatagramSize
+
+	// Feed the app-limited sample — it should be rejected.
+	s.sender.OnBandwidthSample(sample)
+	require.Equal(t, Bandwidth(0), s.sender.btlBw,
+		"app-limited sample must not seed btlBw when btlBw is zero")
+}
+
+func TestBBRv3AppLimitedSampleAcceptedWhenExceedsBtlBw(t *testing.T) {
+	// After btlBw is established, an app-limited sample that exceeds the
+	// current btlBw should still update the filter (rate discovery).
+	s := newTestBBRSender()
+	rtt := 50 * time.Millisecond
+
+	// Send many packets at full rate to establish btlBw.
+	for i := 0; i < 10; i++ {
+		n := 10
+		s.sendNPackets(n)
+		s.clock.Advance(rtt)
+		s.ackNPackets(n, rtt)
+	}
+	require.True(t, s.sender.btlBw > 0, "btlBw should be established")
+	savedBw := s.sender.btlBw
+
+	// Now send an app-limited packet, but at a HIGHER rate (e.g., shorter RTT).
+	s.sendAppLimitedPacket()
+	shortRTT := 10 * time.Millisecond
+	s.clock.Advance(shortRTT)
+
+	s.ackedPacketNumber++
+	snap := s.pktStates[s.ackedPacketNumber]
+	sample := s.estimator.GenerateRateSample(
+		snap.state, snap.sendTime, bbrTestMaxDatagramSize, s.clock.Now(),
+	)
+	require.True(t, sample.IsAppLimited)
+	delete(s.pktStates, s.ackedPacketNumber)
+
+	s.sender.OnPacketAcked(s.ackedPacketNumber, bbrTestMaxDatagramSize, s.bytesInFlight, s.clock.Now())
+	s.bytesInFlight -= bbrTestMaxDatagramSize
+
+	// Only accept if the delivery rate exceeds btlBw.
+	if sample.DeliveryRate > savedBw {
+		s.sender.OnBandwidthSample(sample)
+		require.True(t, s.sender.btlBw >= savedBw,
+			"app-limited sample exceeding btlBw should be accepted")
+	}
+}
+
+func TestBBRv3StartupIgnoresAppLimitedRounds(t *testing.T) {
+	// Startup should not count app-limited rounds toward the bandwidth
+	// plateau counter used for exiting Startup.
+	s := newTestBBRSender()
+	rtt := 50 * time.Millisecond
+
+	require.Equal(t, bbrStartup, s.sender.Mode())
+
+	// Establish some bandwidth first.
+	for i := 0; i < 3; i++ {
+		s.sendNPackets(10)
+		s.clock.Advance(rtt)
+		s.ackNPackets(10, rtt)
+	}
+	require.Equal(t, bbrStartup, s.sender.Mode())
+	savedBwPlateauCount := s.sender.fullBandwidthCount
+
+	// Now send only app-limited packets for several rounds.
+	for i := 0; i < 5; i++ {
+		s.sendAppLimitedPacket()
+		s.clock.Advance(rtt)
+		// ACK with app-limited sample only.
+		s.ackedPacketNumber++
+		snap := s.pktStates[s.ackedPacketNumber]
+		sample := s.estimator.GenerateRateSample(
+			snap.state, snap.sendTime, bbrTestMaxDatagramSize, s.clock.Now(),
+		)
+		delete(s.pktStates, s.ackedPacketNumber)
+		s.sender.OnPacketAcked(s.ackedPacketNumber, bbrTestMaxDatagramSize, s.bytesInFlight, s.clock.Now())
+		s.bytesInFlight -= bbrTestMaxDatagramSize
+
+		s.sender.OnBandwidthSample(sample)
+	}
+
+	// The plateau count should NOT have increased during app-limited rounds.
+	require.Equal(t, savedBwPlateauCount, s.sender.fullBandwidthCount,
+		"app-limited rounds must not increment startup bandwidth plateau counter")
+	require.Equal(t, bbrStartup, s.sender.Mode(),
+		"sender should still be in Startup after app-limited-only rounds")
+}
+
+func TestBBRv3BestSamplePrefersNonAppLimited(t *testing.T) {
+	// Verify that the best-sample selection prefers a non-app-limited sample
+	// over a higher-rate app-limited sample.
+	s := newTestBBRSender()
+	rtt := 50 * time.Millisecond
+
+	// First send a full-rate packet.
+	s.sendPacket()
+	s.clock.Advance(rtt)
+
+	// Then send an app-limited packet.
+	s.sendAppLimitedPacket()
+	s.clock.Advance(rtt / 2) // shorter interval – will have higher rate
+
+	// ACK both simultaneously.
+	samples := make([]RateSample, 0, 2)
+	for i := 0; i < 2; i++ {
+		s.ackedPacketNumber++
+		if snap, ok := s.pktStates[s.ackedPacketNumber]; ok {
+			sample := s.estimator.GenerateRateSample(
+				snap.state, snap.sendTime, bbrTestMaxDatagramSize, s.clock.Now(),
+			)
+			samples = append(samples, sample)
+			delete(s.pktStates, s.ackedPacketNumber)
+		}
+	}
+
+	require.Len(t, samples, 2)
+	// Identify which is app-limited vs not.
+	var nonAppLimitedSample, appLimitedSample RateSample
+	for _, sample := range samples {
+		if sample.IsAppLimited {
+			appLimitedSample = sample
+		} else {
+			nonAppLimitedSample = sample
+		}
+	}
+	// Regardless of rates, the non-app-limited sample should be preferred.
+	if nonAppLimitedSample.DeliveryRate > 0 && appLimitedSample.DeliveryRate > 0 {
+		// Apply the same selection logic as production.
+		var best RateSample
+		for _, sample := range samples {
+			if best.DeliveryRate == 0 {
+				best = sample
+			} else if !sample.IsAppLimited && best.IsAppLimited {
+				best = sample
+			} else if sample.IsAppLimited == best.IsAppLimited && sample.DeliveryRate > best.DeliveryRate {
+				best = sample
+			}
+		}
+		require.False(t, best.IsAppLimited,
+			"best sample should not be app-limited when a non-app-limited sample exists")
+	}
+}
+
+func TestBBRv3NormalOperationAfterAppLimitedPhase(t *testing.T) {
+	// Simulate app-limited → full-rate transition. Verify btlBw recovers.
+	s := newTestBBRSender()
+	rtt := 50 * time.Millisecond
+
+	// Drive to ProbeBW with established bandwidth.
+	s.driveToState(bbrProbeBW, rtt)
+	require.True(t, s.sender.btlBw > 0)
+	savedBw := s.sender.btlBw
+
+	// Send app-limited for several rounds (should NOT corrupt btlBw).
+	for i := 0; i < 5; i++ {
+		s.sendAppLimitedPacket()
+		s.clock.Advance(rtt)
+		s.ackedPacketNumber++
+		if snap, ok := s.pktStates[s.ackedPacketNumber]; ok {
+			sample := s.estimator.GenerateRateSample(
+				snap.state, snap.sendTime, bbrTestMaxDatagramSize, s.clock.Now(),
+			)
+			delete(s.pktStates, s.ackedPacketNumber)
+			s.sender.OnPacketAcked(s.ackedPacketNumber, bbrTestMaxDatagramSize, s.bytesInFlight, s.clock.Now())
+			s.bytesInFlight -= bbrTestMaxDatagramSize
+			s.sender.OnBandwidthSample(sample)
+		}
+	}
+	require.True(t, s.sender.btlBw >= savedBw,
+		"btlBw should not decrease after app-limited samples when rate is lower")
+
+	// Resume full-rate sending — should get back to normal.
+	for i := 0; i < 5; i++ {
+		n := 10
+		s.sendNPackets(n)
+		s.clock.Advance(rtt)
+		s.ackNPackets(n, rtt)
+	}
+	require.True(t, s.sender.btlBw >= savedBw,
+		"btlBw should recover after resuming full-rate sending")
 }

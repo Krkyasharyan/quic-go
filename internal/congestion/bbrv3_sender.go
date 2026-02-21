@@ -155,14 +155,16 @@ type bbrv3Sender struct {
 	minRttExpired   bool            // whether the min RTT window has expired
 
 	// --- Round Tracking ---
-	currentRoundTripEnd protocol.PacketNumber
-	roundCount          int64
-	roundStart          bool
+	currentRoundTripEnd       protocol.PacketNumber
+	roundCount                int64
+	roundStart                bool
+	newRoundSinceLastBwSample bool // sticky flag: set in updateRound, consumed by OnBandwidthSample
 
 	// --- Startup ---
-	fullBandwidth        Bandwidth // bandwidth at which we last declared "full"
-	fullBandwidthCount   int       // consecutive rounds without ≥25% BW growth
-	startupFullBWReached bool
+	fullBandwidth          Bandwidth // bandwidth at which we last declared "full"
+	fullBandwidthCount     int       // consecutive rounds without ≥25% BW growth
+	startupFullBWReached   bool
+	lastBwSampleAppLimited bool // whether the most recent OnBandwidthSample was app-limited
 
 	// --- Loss tracking for current round ---
 	lossInRound    protocol.ByteCount // bytes lost in current round
@@ -308,7 +310,12 @@ func (b *bbrv3Sender) OnPacketAcked(
 	// 4. Run the state machine.
 	switch b.mode {
 	case bbrStartup:
-		b.checkStartupDone()
+		// The full Startup bandwidth check is deferred to OnBandwidthSample
+		// so that lastBwSampleAppLimited is correctly set. Here we only
+		// handle the deferred transition when the flag is already set.
+		if b.startupFullBWReached {
+			b.enterDrain()
+		}
 	case bbrDrain:
 		b.checkDrain(priorInFlight)
 	case bbrProbeBW:
@@ -517,24 +524,45 @@ func (b *bbrv3Sender) PacingRate() Bandwidth {
 // delivery-rate sample from an ACK frame. It replaces the old per-packet
 // ackedBytes/RTT heuristic with a proper delivery-rate estimate.
 func (b *bbrv3Sender) OnBandwidthSample(sample RateSample) {
-	// If the sample was taken during an app-limited period and the measured
-	// rate doesn't exceed our current best, discard it — we don't want
-	// idle periods to pollute the max-bandwidth filter.
-	if sample.IsAppLimited && sample.DeliveryRate <= b.btlBw {
-		return
-	}
-
-	// Update the windowed max filter (keyed by round count).
-	b.maxBwFilter.Update(int64(sample.DeliveryRate), b.roundCount)
-	b.btlBw = Bandwidth(b.maxBwFilter.GetBest())
-
-	// Track cumulative delivered for per-round loss rate calculation.
+	// Always track cumulative delivered for per-round loss rate calculation,
+	// regardless of whether the sample is app-limited.
 	if sample.Delivered > b.lastDelivered {
 		b.lastDelivered = sample.Delivered
 	}
 
 	// Stash the latest sample rate for diagnostic logging.
 	b.lastSampleRate = sample.DeliveryRate
+
+	// BBRv3 strict app-limited filtering:
+	// If the sample was taken during an app-limited period, it reflects
+	// the application's sending rate, NOT the bottleneck capacity.
+	// Only allow app-limited samples into the bandwidth filter if:
+	// (a) we already have a non-zero btlBw estimate, AND
+	// (b) the sample exceeds the current estimate.
+	// When btlBw == 0, we MUST wait for a non-app-limited sample to seed
+	// the filter, otherwise idle/tiny payloads permanently depress btlBw
+	// and trigger the "app-limited death spiral."
+	if sample.IsAppLimited {
+		b.lastBwSampleAppLimited = true
+		if b.btlBw == 0 || sample.DeliveryRate <= b.btlBw {
+			return
+		}
+	} else {
+		b.lastBwSampleAppLimited = false
+	}
+
+	// Update the windowed max filter (keyed by round count).
+	b.maxBwFilter.Update(int64(sample.DeliveryRate), b.roundCount)
+	b.btlBw = Bandwidth(b.maxBwFilter.GetBest())
+
+	// After updating bandwidth, check if Startup should exit.
+	// This runs here (not in OnPacketAcked) so that lastBwSampleAppLimited
+	// is already set before the Startup bandwidth plateau check.
+	if b.mode == bbrStartup {
+		b.checkStartupDone()
+	}
+	// Clear the sticky round flag after consuming it.
+	b.newRoundSinceLastBwSample = false
 }
 
 // ---------- RTT Estimation ----------
@@ -575,6 +603,7 @@ func (b *bbrv3Sender) updateRound(lastAckedPacket protocol.PacketNumber) {
 	if lastAckedPacket > b.currentRoundTripEnd {
 		b.roundCount++
 		b.roundStart = true
+		b.newRoundSinceLastBwSample = true
 		b.currentRoundTripEnd = b.largestSentPacketNumber
 		// Reset per-round loss tracking at the start of each round.
 		b.lossInRound = 0
@@ -599,7 +628,15 @@ func (b *bbrv3Sender) checkStartupDone() {
 }
 
 func (b *bbrv3Sender) checkStartupFullBandwidth() {
-	if !b.roundStart {
+	if !b.newRoundSinceLastBwSample {
+		return
+	}
+
+	// Don't evaluate Startup exit on rounds where the only bandwidth
+	// sample was app-limited. A stagnant btlBw during app-limited rounds
+	// does NOT indicate the bottleneck has been reached — it means the
+	// application wasn't sending enough data to probe the pipe.
+	if b.lastBwSampleAppLimited {
 		return
 	}
 

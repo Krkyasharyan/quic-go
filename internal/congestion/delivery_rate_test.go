@@ -30,7 +30,7 @@ func TestDeliveryRateEstimatorBatchedACK(t *testing.T) {
 	// --- Send path ---
 	var bytesInFlight protocol.ByteCount
 	for i := 0; i < 10; i++ {
-		state := e.OnPacketSent(now, bytesInFlight, false)
+		state := e.OnPacketSent(now, bytesInFlight)
 		packets[i] = pktInfo{state: state, sendTime: now}
 		bytesInFlight += testPacketSize
 		now += monotime.Time(interval)
@@ -74,11 +74,11 @@ func TestDeliveryRateEstimatorSendElapsedVsAckElapsed(t *testing.T) {
 	var now monotime.Time = 1_000_000_000
 
 	// Send 2 packets 50ms apart.
-	s1 := e.OnPacketSent(now, 0, false)
+	s1 := e.OnPacketSent(now, 0)
 	t1 := now
 	now += monotime.Time(50 * time.Millisecond)
 
-	s2 := e.OnPacketSent(now, testPacketSize, false)
+	s2 := e.OnPacketSent(now, testPacketSize)
 	t2 := now
 
 	// Case 1: ACK both at send_time + 60ms (ackElapsed for pkt1 = 60ms > sendElapsed for pkt2 = 50ms).
@@ -95,10 +95,10 @@ func TestDeliveryRateEstimatorSendElapsedVsAckElapsed(t *testing.T) {
 	now2 := monotime.Time(2_000_000_000)
 
 	// Case 2: Send 2 packets 100ms apart, ACK both 30ms after first send.
-	s1b := e2.OnPacketSent(now2, 0, false)
+	s1b := e2.OnPacketSent(now2, 0)
 	t1b := now2
 	now2 += monotime.Time(100 * time.Millisecond)
-	s2b := e2.OnPacketSent(now2, testPacketSize, false)
+	s2b := e2.OnPacketSent(now2, testPacketSize)
 	t2b := now2
 
 	ackTime2 := t1b + monotime.Time(30*time.Millisecond)
@@ -114,8 +114,9 @@ func TestDeliveryRateEstimatorAppLimited(t *testing.T) {
 
 	var now monotime.Time = 1_000_000_000
 
-	// Send a packet while app-limited (sender has no data to fill the pipe).
-	state := e.OnPacketSent(now, 0, true)
+	// Mark as app-limited, then send a packet.
+	e.SetAppLimited(true)
+	state := e.OnPacketSent(now, 0)
 	require.True(t, state.IsAppLimited, "snapshot should record app-limited state")
 
 	// ACK it.
@@ -123,9 +124,10 @@ func TestDeliveryRateEstimatorAppLimited(t *testing.T) {
 	sample := e.GenerateRateSample(state, now, testPacketSize, ackTime)
 	require.True(t, sample.IsAppLimited, "sample should be marked as app-limited")
 
-	// Send a packet when NOT app-limited.
+	// Clear app-limited, send a packet when NOT app-limited.
+	e.SetAppLimited(false)
 	now = ackTime
-	state2 := e.OnPacketSent(now, testPacketSize, false)
+	state2 := e.OnPacketSent(now, testPacketSize)
 	require.False(t, state2.IsAppLimited, "should not be app-limited")
 }
 
@@ -133,7 +135,7 @@ func TestDeliveryRateEstimatorZeroInterval(t *testing.T) {
 	e := NewDeliveryRateEstimator()
 
 	now := monotime.Time(1_000_000_000)
-	state := e.OnPacketSent(now, 0, false)
+	state := e.OnPacketSent(now, 0)
 
 	// ACK immediately (same timestamp → interval = 0).
 	sample := e.GenerateRateSample(state, now, testPacketSize, now)
@@ -147,7 +149,7 @@ func TestDeliveryRateEstimatorCumulativeDelivered(t *testing.T) {
 
 	// Send and ACK 3 packets sequentially.
 	for i := 0; i < 3; i++ {
-		state := e.OnPacketSent(now, protocol.ByteCount(i)*testPacketSize, false)
+		state := e.OnPacketSent(now, protocol.ByteCount(i)*testPacketSize)
 		now += monotime.Time(10 * time.Millisecond)
 		_ = e.GenerateRateSample(state, now-monotime.Time(10*time.Millisecond), testPacketSize, now)
 	}
@@ -161,12 +163,12 @@ func TestDeliveryRateEstimatorNewFlightResets(t *testing.T) {
 	now := monotime.Time(1_000_000_000)
 
 	// First flight.
-	s1 := e.OnPacketSent(now, 0, false) // bytesInFlight=0 → new flight
+	s1 := e.OnPacketSent(now, 0) // bytesInFlight=0 → new flight
 	require.Equal(t, now, s1.FirstSentTime, "first packet should set firstSentTime")
 
 	// Second packet in same flight.
 	now += monotime.Time(time.Millisecond)
-	s2 := e.OnPacketSent(now, testPacketSize, false)
+	s2 := e.OnPacketSent(now, testPacketSize)
 	require.Equal(t, s1.FirstSentTime, s2.FirstSentTime, "same flight should keep firstSentTime")
 
 	// ACK both, then start a new flight.
@@ -176,7 +178,7 @@ func TestDeliveryRateEstimatorNewFlightResets(t *testing.T) {
 
 	// New flight (bytesInFlight=0 again).
 	now = ackTime + monotime.Time(time.Millisecond)
-	s3 := e.OnPacketSent(now, 0, false)
+	s3 := e.OnPacketSent(now, 0)
 	require.Equal(t, now, s3.FirstSentTime, "new flight should reset firstSentTime")
 }
 
@@ -199,7 +201,7 @@ func TestDeliveryRateEstimatorImmunityToACKAggregation(t *testing.T) {
 	}
 	pktsA := make([]sentPkt, numPackets)
 	for i := 0; i < numPackets; i++ {
-		s := eA.OnPacketSent(nowA, bytesInFlightA, false)
+		s := eA.OnPacketSent(nowA, bytesInFlightA)
 		pktsA[i] = sentPkt{state: s, sendTime: nowA}
 		bytesInFlightA += testPacketSize
 		nowA += monotime.Time(sendInterval)
@@ -220,7 +222,7 @@ func TestDeliveryRateEstimatorImmunityToACKAggregation(t *testing.T) {
 	var bytesInFlightB protocol.ByteCount
 	pktsB := make([]sentPkt, numPackets)
 	for i := 0; i < numPackets; i++ {
-		s := eB.OnPacketSent(nowB, bytesInFlightB, false)
+		s := eB.OnPacketSent(nowB, bytesInFlightB)
 		pktsB[i] = sentPkt{state: s, sendTime: nowB}
 		bytesInFlightB += testPacketSize
 		nowB += monotime.Time(sendInterval)

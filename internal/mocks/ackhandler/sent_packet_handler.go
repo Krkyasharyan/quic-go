@@ -155,6 +155,42 @@ func (c *MockSentPacketHandlerGetLossDetectionTimeoutCall) DoAndReturn(f func() 
 	return c
 }
 
+// MarkAppLimited mocks base method.
+func (m *MockSentPacketHandler) MarkAppLimited() {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "MarkAppLimited")
+}
+
+// MarkAppLimited indicates an expected call of MarkAppLimited.
+func (mr *MockSentPacketHandlerMockRecorder) MarkAppLimited() *MockSentPacketHandlerMarkAppLimitedCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "MarkAppLimited", reflect.TypeOf((*MockSentPacketHandler)(nil).MarkAppLimited))
+	return &MockSentPacketHandlerMarkAppLimitedCall{Call: call}
+}
+
+// MockSentPacketHandlerMarkAppLimitedCall wrap *gomock.Call
+type MockSentPacketHandlerMarkAppLimitedCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockSentPacketHandlerMarkAppLimitedCall) Return() *MockSentPacketHandlerMarkAppLimitedCall {
+	c.Call = c.Call.Return()
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockSentPacketHandlerMarkAppLimitedCall) Do(f func()) *MockSentPacketHandlerMarkAppLimitedCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockSentPacketHandlerMarkAppLimitedCall) DoAndReturn(f func()) *MockSentPacketHandlerMarkAppLimitedCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}
+
 // MigratedPath mocks base method.
 func (m *MockSentPacketHandler) MigratedPath(now monotime.Time, initialMaxPacketSize protocol.ByteCount) {
 	m.ctrl.T.Helper()

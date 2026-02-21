@@ -2562,6 +2562,10 @@ func (c *Conn) sendPacketsWithoutGSO(now monotime.Time) error {
 		if _, err := c.appendOneShortHeaderPacket(buf, c.maxPacketSize(), ecn, now); err != nil {
 			if err == errNothingToPack {
 				buf.Release()
+				// No more data to send. If the congestion window isn't full,
+				// the connection is application-limited. Mark the delivery rate
+				// estimator so subsequent packets are tagged correctly.
+				c.sentPacketHandler.MarkAppLimited()
 				return nil
 			}
 			return err
@@ -2605,6 +2609,8 @@ func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
 			}
 			if buf.Len() == 0 {
 				buf.Release()
+				// No more data to send — mark app-limited.
+				c.sentPacketHandler.MarkAppLimited()
 				return nil
 			}
 			dontSendMore = true

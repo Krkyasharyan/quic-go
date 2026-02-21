@@ -32,6 +32,11 @@ type SentPacketHandler interface {
 	PeekPacketNumber(protocol.EncryptionLevel) (protocol.PacketNumber, protocol.PacketNumberLen)
 	PopPacketNumber(protocol.EncryptionLevel) protocol.PacketNumber
 
+	// MarkAppLimited signals that the application has run out of data to send
+	// while the congestion window is not full. This is used by the delivery
+	// rate estimator to avoid polluting bandwidth estimates with app-limited samples.
+	MarkAppLimited()
+
 	GetLossDetectionTimeout() monotime.Time
 	OnLossDetectionTimeout(now monotime.Time) error
 
