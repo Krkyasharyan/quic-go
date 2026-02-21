@@ -25,3 +25,11 @@ type SendAlgorithmWithDebugInfos interface {
 	InRecovery() bool
 	GetCongestionWindow() protocol.ByteCount
 }
+
+// ECNCongestionConsumer is optionally implemented by congestion controllers
+// that handle ECN Congestion Experienced (CE) signals separately from packet
+// loss. Controllers that do not implement this interface will receive ECN-CE
+// events via OnCongestionEvent with lostBytes=0 (legacy behavior).
+type ECNCongestionConsumer interface {
+	OnECNCongestion(priorInFlight protocol.ByteCount)
+}

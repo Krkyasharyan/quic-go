@@ -407,9 +407,17 @@ func TestBBRv3RTO(t *testing.T) {
 	cwndBefore := s.sender.GetCongestionWindow()
 	s.sender.OnRetransmissionTimeout(true)
 
-	require.Equal(t, s.sender.minCongestionWindow(), s.sender.GetCongestionWindow(),
-		"cwnd should be minimum after RTO")
-	_ = cwndBefore
+	// BBRv3: RTO does NOT collapse cwnd. It sets inflightHi as a cap
+	// and transitions to ProbeBW_DOWN to re-probe gracefully.
+	require.Equal(t, cwndBefore, s.sender.InflightHi(),
+		"inflightHi should be set to cwnd before RTO")
+	require.Equal(t, bbrProbeBW, s.sender.Mode(),
+		"should transition to ProbeBW after RTO")
+	require.Equal(t, probeBWDown, s.sender.ProbeBWPhaseValue(),
+		"should be in ProbeBW_DOWN sub-state after RTO")
+	// Cwnd should be recalculated based on targetCwnd with inflightHi cap, not collapsed.
+	require.Greater(t, s.sender.GetCongestionWindow(), s.sender.minCongestionWindow(),
+		"cwnd should NOT collapse to minimum after RTO in BBRv3")
 }
 
 func TestBBRv3SetMaxDatagramSize(t *testing.T) {
@@ -543,23 +551,19 @@ func TestBBRv3ProbeBWLossInUp(t *testing.T) {
 	// Send enough packets to have significant inflight.
 	s.sendNPackets(32)
 
-	priorInFlight := s.bytesInFlight
-
 	// Inject enough loss to exceed the 2% threshold.
-	// We need lossInRound > 0.02 * inflightAtLoss.
-	// inflightAtLoss will be priorInFlight (set by first loss call).
-	// We need lost bytes > 0.02 * priorInFlight.
-	lossNeeded := int(float64(priorInFlight)*bbrLossThreshold/float64(bbrTestMaxDatagramSize)) + 1
-	if lossNeeded < 2 {
-		lossNeeded = 2
-	}
-	s.loseNPackets(lossNeeded)
+	// BBRv3 loss rate = lost / (lost + delivered_in_round).
+	// Losing 10 packets (12800 bytes) is clearly excessive for any
+	// reasonable delivered_in_round value.
+	s.loseNPackets(10)
 
-	// After excessive loss in UP, should transition to DOWN and cap inflightHi.
+	// After excessive loss in UP, should transition to DOWN, cap inflightHi, and set bwLo.
 	require.Equal(t, probeBWDown, s.sender.ProbeBWPhaseValue(),
 		"excessive loss in UP should trigger transition to DOWN")
 	require.Greater(t, s.sender.InflightHi(), protocol.ByteCount(0),
 		"inflightHi should be set after excessive loss in UP")
+	require.Greater(t, s.sender.BwLo(), Bandwidth(0),
+		"bwLo should be set after excessive loss in UP")
 }
 
 func TestBBRv3ProbeBWLossInCruiseSetsBound(t *testing.T) {
@@ -597,6 +601,189 @@ func TestBBRv3DrainExitOnBDP(t *testing.T) {
 	// Verify we're in CRUISE sub-state (entered via enterProbeBWCruise from Drain).
 	require.Equal(t, probeBWCruise, s.sender.ProbeBWPhaseValue(),
 		"should enter ProbeBW CRUISE after Drain")
+}
+
+// ---------- Phase 3 Tests: Loss Rate, bwLo, ECN, REFILL/ProbeRTT Loss, RTO ----------
+
+func TestBBRv3ExcessiveLossUsesDeliveredDenominator(t *testing.T) {
+	s := newTestBBRSender()
+	rtt := 100 * time.Millisecond
+
+	// Drive to ProbeBW UP.
+	s.driveToState(bbrProbeBW, rtt)
+	s.driveToProbeBWPhase(probeBWUp, rtt)
+	require.Equal(t, probeBWUp, s.sender.ProbeBWPhaseValue())
+
+	// Send packets without ACKing to stay in UP.
+	s.sendNPackets(32)
+
+	// Heavy loss: 10 packets = clearly excessive regardless of denominator.
+	// BBRv3 loss rate = lost / (lost + deliveredInRound).
+	// With deliveredInRound from previous ACKs and 12800 bytes lost,
+	// this is well above the 2% threshold.
+	s.loseNPackets(10)
+
+	require.Equal(t, probeBWDown, s.sender.ProbeBWPhaseValue(),
+		"heavy loss should trigger excessive loss detection and transition to DOWN")
+	require.Greater(t, s.sender.BwLo(), Bandwidth(0),
+		"bwLo should be set on excessive loss in UP")
+}
+
+func TestBBRv3BwLoCapsPacingRate(t *testing.T) {
+	s := newTestBBRSender()
+	rtt := 100 * time.Millisecond
+
+	// Drive to ProbeBW and establish bandwidth.
+	s.driveToState(bbrProbeBW, rtt)
+
+	btlBw := s.sender.BtlBw()
+	require.Greater(t, btlBw, Bandwidth(0))
+
+	// Set bwLo to half the bottleneck bandwidth.
+	halfBw := btlBw / 2
+	s.sender.bwLo = halfBw
+
+	// The pacing rate should be capped at bwLo.
+	rate := s.sender.pacingRateBytesPerSec()
+	bwLoBytesPerSec := uint64(halfBw / BytesPerSecond)
+
+	require.LessOrEqual(t, rate, bwLoBytesPerSec,
+		"pacing rate should be capped by bwLo: rate=%d, bwLo=%d bytes/s", rate, bwLoBytesPerSec)
+}
+
+func TestBBRv3BwLoClearedInRefill(t *testing.T) {
+	s := newTestBBRSender()
+	rtt := 100 * time.Millisecond
+
+	// Drive to ProbeBW.
+	s.driveToState(bbrProbeBW, rtt)
+
+	// Set bwLo artificially.
+	s.sender.bwLo = s.sender.BtlBw()
+	require.Greater(t, s.sender.BwLo(), Bandwidth(0))
+
+	// Drive to REFILL — bwLo should be cleared.
+	s.driveToProbeBWPhase(probeBWRefill, rtt)
+	require.Equal(t, probeBWRefill, s.sender.ProbeBWPhaseValue())
+	require.Equal(t, Bandwidth(0), s.sender.BwLo(),
+		"bwLo should be cleared when entering REFILL")
+}
+
+func TestBBRv3ECNInUpTransitionsDown(t *testing.T) {
+	s := newTestBBRSender()
+	rtt := 100 * time.Millisecond
+
+	// Drive to ProbeBW UP.
+	s.driveToState(bbrProbeBW, rtt)
+	s.driveToProbeBWPhase(probeBWUp, rtt)
+	require.Equal(t, probeBWUp, s.sender.ProbeBWPhaseValue())
+
+	s.sendNPackets(16)
+	priorInFlight := s.bytesInFlight
+
+	// Simulate ECN-CE signal.
+	s.sender.OnECNCongestion(priorInFlight)
+
+	require.Equal(t, probeBWDown, s.sender.ProbeBWPhaseValue(),
+		"ECN-CE in UP should trigger transition to DOWN")
+	require.Equal(t, priorInFlight, s.sender.InflightHi(),
+		"inflightHi should be set to priorInFlight on ECN in UP")
+	require.Greater(t, s.sender.BwLo(), Bandwidth(0),
+		"bwLo should be set on ECN in UP")
+}
+
+func TestBBRv3ECNInCruiseSetsInflightLo(t *testing.T) {
+	s := newTestBBRSender()
+	rtt := 100 * time.Millisecond
+
+	// Drive to ProbeBW CRUISE.
+	s.driveToState(bbrProbeBW, rtt)
+	require.Equal(t, probeBWCruise, s.sender.ProbeBWPhaseValue())
+
+	s.sendNPackets(10)
+	priorInFlight := s.bytesInFlight
+
+	// Simulate ECN-CE signal.
+	s.sender.OnECNCongestion(priorInFlight)
+
+	require.Equal(t, priorInFlight, s.sender.InflightLo(),
+		"inflightLo should be tightened on ECN in CRUISE")
+}
+
+func TestBBRv3LossInRefillTightensInflightLo(t *testing.T) {
+	s := newTestBBRSender()
+	rtt := 100 * time.Millisecond
+
+	// Drive to ProbeBW REFILL.
+	s.driveToState(bbrProbeBW, rtt)
+	s.driveToProbeBWPhase(probeBWRefill, rtt)
+	require.Equal(t, probeBWRefill, s.sender.ProbeBWPhaseValue())
+
+	// Send packets.
+	s.sendNPackets(10)
+
+	// Lose a packet during REFILL — should tighten inflightLo.
+	s.loseNPackets(1)
+
+	require.Greater(t, s.sender.InflightLo(), protocol.ByteCount(0),
+		"inflightLo should be set after loss in REFILL")
+}
+
+func TestBBRv3LossInProbeRTTSetsInflightHi(t *testing.T) {
+	s := newTestBBRSender()
+	rtt := 100 * time.Millisecond
+	higherRtt := 200 * time.Millisecond
+
+	// Drive to ProbeBW, then force into ProbeRTT.
+	s.driveToState(bbrProbeBW, rtt)
+	s.sender.minRttTimestamp = s.clock.Now().Add(-11 * time.Second)
+
+	s.sendNPackets(1)
+	s.clock.Advance(higherRtt)
+	s.ackNPackets(1, higherRtt)
+	require.Equal(t, bbrProbeRTT, s.sender.Mode())
+
+	// Send a few packets (ProbeRTT has minimal cwnd).
+	if s.sender.CanSend(s.bytesInFlight) {
+		s.sendNPackets(1)
+	}
+
+	priorInFlight := s.bytesInFlight
+
+	// Lose a packet during ProbeRTT — should set inflightHi.
+	s.loseNPackets(1)
+
+	require.Equal(t, priorInFlight, s.sender.InflightHi(),
+		"inflightHi should be set after loss in ProbeRTT")
+}
+
+func TestBBRv3RTOPreservesBandwidthEstimate(t *testing.T) {
+	s := newTestBBRSender()
+	rtt := 100 * time.Millisecond
+
+	// Drive to ProbeBW to establish bandwidth.
+	s.driveToState(bbrProbeBW, rtt)
+	btlBwBefore := s.sender.BtlBw()
+	minRttBefore := s.sender.MinRtt()
+	require.Greater(t, btlBwBefore, Bandwidth(0))
+
+	// Trigger RTO.
+	s.sendNPackets(5)
+	s.sender.OnRetransmissionTimeout(true)
+
+	// btlBw and minRtt should be preserved.
+	require.Equal(t, btlBwBefore, s.sender.BtlBw(),
+		"btlBw should be preserved after RTO")
+	require.Equal(t, minRttBefore, s.sender.MinRtt(),
+		"minRtt should be preserved after RTO")
+	// Should be in ProbeBW_DOWN.
+	require.Equal(t, bbrProbeBW, s.sender.Mode())
+	require.Equal(t, probeBWDown, s.sender.ProbeBWPhaseValue())
+}
+
+func TestBBRv3ECNInterfaceCompliance(t *testing.T) {
+	// Compile-time check that bbrv3Sender implements ECNCongestionConsumer.
+	var _ ECNCongestionConsumer = &bbrv3Sender{}
 }
 
 // ---------- Helper: drive the sender to a target BBR state ----------

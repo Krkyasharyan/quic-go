@@ -89,10 +89,10 @@ type sentPacketHandler struct {
 
 	bytesInFlight protocol.ByteCount
 
-	congestion         congestion.SendAlgorithmWithDebugInfos
-	deliveryEstimator  *congestion.DeliveryRateEstimator
-	rttStats           *utils.RTTStats
-	connStats          *utils.ConnectionStats
+	congestion        congestion.SendAlgorithmWithDebugInfos
+	deliveryEstimator *congestion.DeliveryRateEstimator
+	rttStats          *utils.RTTStats
+	connStats         *utils.ConnectionStats
 
 	// The number of times a PTO has been sent without receiving an ack.
 	ptoCount uint32
@@ -437,7 +437,13 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 	if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil && largestAcked > pnSpace.largestAcked {
 		congested := h.ecnTracker.HandleNewlyAcked(ackedPackets, int64(ack.ECT0), int64(ack.ECT1), int64(ack.ECNCE))
 		if congested {
-			h.congestion.OnCongestionEvent(largestAcked, 0, priorInFlight)
+			// If the congestion controller supports ECN natively, use the
+			// dedicated ECN path. Otherwise fall back to the generic loss event.
+			if ecnConsumer, ok := h.congestion.(congestion.ECNCongestionConsumer); ok {
+				ecnConsumer.OnECNCongestion(priorInFlight)
+			} else {
+				h.congestion.OnCongestionEvent(largestAcked, 0, priorInFlight)
+			}
 		}
 	}
 

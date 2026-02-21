@@ -168,6 +168,10 @@ type bbrv3Sender struct {
 	lossInRound    protocol.ByteCount // bytes lost in current round
 	inflightAtLoss protocol.ByteCount // bytes in flight when loss was detected
 
+	// --- Per-round delivered tracking (BBRv3 loss rate denominator) ---
+	lastDelivered         protocol.ByteCount // cumulative delivered from most recent bandwidth sample
+	deliveredAtRoundStart protocol.ByteCount // cumulative delivered at start of current round
+
 	// --- ProbeRTT ---
 	probeRttDoneAt    monotime.Time
 	probeRttRoundDone bool
@@ -194,6 +198,7 @@ var (
 	_ SendAlgorithm               = &bbrv3Sender{}
 	_ SendAlgorithmWithDebugInfos = &bbrv3Sender{}
 	_ BandwidthSampleConsumer     = &bbrv3Sender{}
+	_ ECNCongestionConsumer       = &bbrv3Sender{}
 )
 
 // NewBBRv3Sender creates a new BBRv3 congestion controller.
@@ -343,6 +348,9 @@ func (b *bbrv3Sender) OnCongestionEvent(
 		b.handleProbeBWLoss(priorInFlight)
 	case bbrDrain:
 		// No cwnd cut in Drain — we are already draining.
+	case bbrProbeRTT:
+		// Loss in ProbeRTT: cap inflight_hi as in Startup.
+		b.inflightHi = priorInFlight
 	}
 
 	b.maybeQlogStateChange(qlog.CongestionStateRecovery)
@@ -352,35 +360,70 @@ func (b *bbrv3Sender) OnCongestionEvent(
 func (b *bbrv3Sender) handleProbeBWLoss(priorInFlight protocol.ByteCount) {
 	switch b.probeBWPhase {
 	case probeBWUp:
-		// Excessive loss during UP: cap inflight_hi and transition to DOWN.
+		// Excessive loss during UP: cap inflight_hi, set bwLo, transition to DOWN.
 		if b.isExcessiveLoss() {
 			b.inflightHi = priorInFlight
+			b.bwLo = b.btlBw
 			b.enterProbeBWDown(b.clock.Now())
 		}
 	case probeBWCruise, probeBWDown:
-		// During CRUISE/DOWN, tighten the lower bound on loss.
+		// During CRUISE/DOWN, tighten the lower inflight bound on loss.
+		if b.inflightLo == 0 || priorInFlight < b.inflightLo {
+			b.inflightLo = priorInFlight
+		}
+		// If excessive loss and bwLo is already set, tighten it proportionally.
+		if b.isExcessiveLoss() && b.bwLo > 0 {
+			lossRate := b.currentLossRate()
+			b.bwLo = Bandwidth(float64(b.bwLo) * (1.0 - lossRate))
+		}
+	case probeBWRefill:
+		// Loss in REFILL: tighten the lower inflight bound.
 		if b.inflightLo == 0 || priorInFlight < b.inflightLo {
 			b.inflightLo = priorInFlight
 		}
 	}
 }
 
-// isExcessiveLoss returns true if the loss in the current round exceeds
-// the BBRv3 loss threshold (2% of inflight at loss detection).
+// isExcessiveLoss returns true if the loss rate in the current round exceeds
+// the BBRv3 loss threshold: lost / (lost + delivered) > 2%.
 func (b *bbrv3Sender) isExcessiveLoss() bool {
-	if b.inflightAtLoss == 0 {
+	var deliveredInRound protocol.ByteCount
+	if b.lastDelivered > b.deliveredAtRoundStart {
+		deliveredInRound = b.lastDelivered - b.deliveredAtRoundStart
+	}
+	total := b.lossInRound + deliveredInRound
+	if total == 0 {
 		return false
 	}
-	return float64(b.lossInRound) > bbrLossThreshold*float64(b.inflightAtLoss)
+	return float64(b.lossInRound) > bbrLossThreshold*float64(total)
+}
+
+// currentLossRate returns the loss rate in the current round:
+// lost / (lost + delivered). Returns 0 if no events in the round.
+func (b *bbrv3Sender) currentLossRate() float64 {
+	var deliveredInRound protocol.ByteCount
+	if b.lastDelivered > b.deliveredAtRoundStart {
+		deliveredInRound = b.lastDelivered - b.deliveredAtRoundStart
+	}
+	total := b.lossInRound + deliveredInRound
+	if total == 0 {
+		return 0
+	}
+	return float64(b.lossInRound) / float64(total)
 }
 
 // OnRetransmissionTimeout is called on a retransmission timeout.
+// BBRv3: RTO does not collapse cwnd. Instead, it sets inflight_hi as a cap
+// at the current cwnd and transitions to ProbeBW_DOWN to re-probe gracefully.
+// This preserves btlBw and minRtt estimates.
 func (b *bbrv3Sender) OnRetransmissionTimeout(packetsRetransmitted bool) {
 	if !packetsRetransmitted {
 		return
 	}
-	b.priorCwnd = b.congestionWindow
-	b.congestionWindow = b.minCongestionWindow()
+	if b.congestionWindow > 0 {
+		b.inflightHi = b.congestionWindow
+	}
+	b.enterProbeBWDown(b.clock.Now())
 	b.largestSentAtLastCutback = protocol.InvalidPacketNumber
 }
 
@@ -433,6 +476,11 @@ func (b *bbrv3Sender) pacingRateBytesPerSec() uint64 {
 	// Apply pacing gain. The result is in bits/s.
 	pacingBw := Bandwidth(float64(bw) * b.pacingGain)
 
+	// Apply bwLo cap (set during loss events, cleared in REFILL).
+	if b.bwLo > 0 && pacingBw > b.bwLo {
+		pacingBw = b.bwLo
+	}
+
 	// Convert to bytes/s.
 	bytesPerSec := uint64(pacingBw / BytesPerSecond)
 
@@ -472,6 +520,11 @@ func (b *bbrv3Sender) OnBandwidthSample(sample RateSample) {
 	// Update the windowed max filter (keyed by round count).
 	b.maxBwFilter.Update(int64(sample.DeliveryRate), b.roundCount)
 	b.btlBw = Bandwidth(b.maxBwFilter.GetBest())
+
+	// Track cumulative delivered for per-round loss rate calculation.
+	if sample.Delivered > b.lastDelivered {
+		b.lastDelivered = sample.Delivered
+	}
 }
 
 // ---------- RTT Estimation ----------
@@ -516,6 +569,8 @@ func (b *bbrv3Sender) updateRound(lastAckedPacket protocol.PacketNumber) {
 		// Reset per-round loss tracking at the start of each round.
 		b.lossInRound = 0
 		b.inflightAtLoss = 0
+		// Snapshot cumulative delivered at round start for loss rate calculation.
+		b.deliveredAtRoundStart = b.lastDelivered
 	} else {
 		b.roundStart = false
 	}
@@ -819,6 +874,45 @@ func (b *bbrv3Sender) maybeQlogStateChange(newState qlog.CongestionState) {
 	b.lastState = newState
 }
 
+// ---------- ECN Congestion Response ----------
+
+// OnECNCongestion handles ECN Congestion Experienced (CE) signals.
+// In BBRv3, ECN-CE is treated as a signal to tighten bounds — similar to
+// excessive loss but without actual byte loss.
+func (b *bbrv3Sender) OnECNCongestion(priorInFlight protocol.ByteCount) {
+	switch b.mode {
+	case bbrStartup:
+		b.inflightHi = priorInFlight
+	case bbrProbeBW:
+		b.handleProbeBWECN(priorInFlight)
+	case bbrProbeRTT:
+		b.inflightHi = priorInFlight
+	case bbrDrain:
+		// No reaction in Drain — we are already draining.
+	}
+}
+
+// handleProbeBWECN implements BBRv3 ECN-CE response during ProbeBW.
+func (b *bbrv3Sender) handleProbeBWECN(priorInFlight protocol.ByteCount) {
+	switch b.probeBWPhase {
+	case probeBWUp:
+		// ECN-CE during UP: cap bounds and transition to DOWN.
+		b.inflightHi = priorInFlight
+		b.bwLo = b.btlBw
+		b.enterProbeBWDown(b.clock.Now())
+	case probeBWCruise, probeBWDown:
+		// ECN-CE during CRUISE/DOWN: tighten lower inflight bound.
+		if b.inflightLo == 0 || priorInFlight < b.inflightLo {
+			b.inflightLo = priorInFlight
+		}
+	case probeBWRefill:
+		// ECN-CE during REFILL: tighten lower inflight bound.
+		if b.inflightLo == 0 || priorInFlight < b.inflightLo {
+			b.inflightLo = priorInFlight
+		}
+	}
+}
+
 // ---------- Exported Helpers (for testing / diagnostics) ----------
 
 // Mode returns the current BBR mode.
@@ -854,4 +948,9 @@ func (b *bbrv3Sender) InflightHi() protocol.ByteCount {
 // InflightLo returns the current lower inflight bound.
 func (b *bbrv3Sender) InflightLo() protocol.ByteCount {
 	return b.inflightLo
+}
+
+// BwLo returns the current lower bandwidth bound (bits/s). 0 means uncapped.
+func (b *bbrv3Sender) BwLo() Bandwidth {
+	return b.bwLo
 }
