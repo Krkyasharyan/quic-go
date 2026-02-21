@@ -35,6 +35,18 @@ func newPacer(getBandwidth func() Bandwidth) *pacer {
 	return p
 }
 
+// newPacerDirect creates a pacer that uses the provided bandwidth callback
+// directly without any adjustment multiplier. This is intended for congestion
+// controllers (like BBR) that manage their own pacing gain externally.
+func newPacerDirect(getBandwidthBytesPerSec func() uint64) *pacer {
+	p := &pacer{
+		maxDatagramSize:   initialMaxDatagramSize,
+		adjustedBandwidth: getBandwidthBytesPerSec,
+	}
+	p.budgetAtLastSent = p.maxBurstSize()
+	return p
+}
+
 func (p *pacer) SentPacket(sendTime monotime.Time, size protocol.ByteCount) {
 	budget := p.Budget(sendTime)
 	if size >= budget {

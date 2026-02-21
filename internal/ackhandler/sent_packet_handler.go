@@ -129,12 +129,11 @@ func NewSentPacketHandler(
 	qlogger qlogwriter.Recorder,
 	logger utils.Logger,
 ) SentPacketHandler {
-	congestion := congestion.NewCubicSender(
+	cc := congestion.NewBBRv3Sender(
 		congestion.DefaultClock{},
 		rttStats,
 		connStats,
 		initialMaxDatagramSize,
-		true, // use Reno
 		qlogger,
 	)
 
@@ -147,7 +146,7 @@ func NewSentPacketHandler(
 		lostPackets:                    *newLostPacketTracker(64),
 		rttStats:                       rttStats,
 		connStats:                      connStats,
-		congestion:                     congestion,
+		congestion:                     cc,
 		ignorePacketsBelow:             ignorePacketsBelow,
 		perspective:                    pers,
 		qlogger:                        qlogger,
@@ -1131,12 +1130,11 @@ func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSi
 	for pn := range h.appDataPackets.history.PathProbes() {
 		h.appDataPackets.history.RemovePathProbe(pn)
 	}
-	h.congestion = congestion.NewCubicSender(
+	h.congestion = congestion.NewBBRv3Sender(
 		congestion.DefaultClock{},
 		h.rttStats,
 		h.connStats,
 		initialMaxDatagramSize,
-		true, // use Reno
 		h.qlogger,
 	)
 	h.setLossDetectionTimer(now)
