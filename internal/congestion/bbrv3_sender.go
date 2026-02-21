@@ -479,22 +479,28 @@ func (b *bbrv3Sender) GetCongestionWindow() protocol.ByteCount {
 // This is the callback passed to the pacer. It applies the death-zone clamp.
 func (b *bbrv3Sender) pacingRateBytesPerSec() uint64 {
   bw := b.btlBw
-  if bw == 0 {
-    srtt := b.rttStats.SmoothedRTT()
-    if srtt == 0 {
-      srtt = protocol.TimerGranularity
-    }
-    bw = BandwidthFromDelta(b.congestionWindow, srtt)
+  srtt := b.rttStats.SmoothedRTT()
+  if srtt == 0 {
+    srtt = protocol.TimerGranularity
+  }
+
+  // Calculate the bandwidth required to empty the current cwnd in one RTT.
+  cwndBw := BandwidthFromDelta(b.congestionWindow, srtt)
+
+  // FIX: The Pacing Bootstrapper.
+  // If our measured bandwidth is smaller than what our cwnd allows, we are 
+  // trapped in an artificial pacing chokehold. Always use the larger of the two.
+  if bw < cwndBw {
+    bw = cwndBw
   }
 
   pacingBw := Bandwidth(float64(bw) * b.pacingGain)
 
+  // Apply bwLo cap
   if b.bwLo > 0 && pacingBw > b.bwLo {
     pacingBw = b.bwLo
   }
 
-  // FIX: Removed the artificial death-zone clamp. 
-  // We must allow the pacer to accelerate seamlessly to find the true BtlBw.
   return uint64(pacingBw / BytesPerSecond)
 }
 
@@ -628,31 +634,37 @@ func (b *bbrv3Sender) checkStartupDone() {
 }
 
 func (b *bbrv3Sender) checkStartupFullBandwidth() {
-	if !b.newRoundSinceLastBwSample {
-		return
-	}
+  if !b.newRoundSinceLastBwSample {
+    return
+  }
 
-	// Don't evaluate Startup exit on rounds where the only bandwidth
-	// sample was app-limited. A stagnant btlBw during app-limited rounds
-	// does NOT indicate the bottleneck has been reached — it means the
-	// application wasn't sending enough data to probe the pipe.
-	if b.lastBwSampleAppLimited {
-		return
-	}
+  if b.lastBwSampleAppLimited {
+    return
+  }
 
-	target := Bandwidth(float64(b.fullBandwidth) * bbrStartupFullBandwidthThreshold)
-	if b.btlBw >= target {
-		// Still growing — reset the counter.
-		b.fullBandwidth = b.btlBw
-		b.fullBandwidthCount = 0
-		return
-	}
+  // FIX: The Premature Exit Guard.
+  // Do not allow Startup to exit if our Congestion Window or BDP hasn't 
+  // even grown past the initial starting value. 
+  initialCwnd := protocol.ByteCount(bbrInitialCongestionWindowPackets) * b.maxDatagramSize
+  if b.congestionWindow <= initialCwnd && b.bdp() <= initialCwnd {
+    b.fullBandwidth = b.btlBw
+    b.fullBandwidthCount = 0
+    return
+  }
 
-	b.fullBandwidthCount++
-	if b.fullBandwidthCount >= bbrStartupFullBandwidthRounds {
-		b.startupFullBWReached = true
-		b.enterDrain()
-	}
+  target := Bandwidth(float64(b.fullBandwidth) * bbrStartupFullBandwidthThreshold)
+  if b.btlBw >= target {
+    // Still growing — reset the counter.
+    b.fullBandwidth = b.btlBw
+    b.fullBandwidthCount = 0
+    return
+  }
+
+  b.fullBandwidthCount++
+  if b.fullBandwidthCount >= bbrStartupFullBandwidthRounds {
+    b.startupFullBWReached = true
+    b.enterDrain()
+  }
 }
 
 func (b *bbrv3Sender) enterDrain() {
