@@ -23,6 +23,16 @@ type testBBRSender struct {
 	bytesInFlight     protocol.ByteCount
 	packetNumber      protocol.PacketNumber
 	ackedPacketNumber protocol.PacketNumber
+
+	// Delivery rate estimation mirroring sent_packet_handler wiring.
+	estimator *DeliveryRateEstimator
+	// Per-packet snapshots keyed by packet number.
+	pktStates map[protocol.PacketNumber]pktSnapshot
+}
+
+type pktSnapshot struct {
+	state    PacketDeliveryState
+	sendTime monotime.Time
 }
 
 func newTestBBRSender() *testBBRSender {
@@ -36,6 +46,8 @@ func newTestBBRSender() *testBBRSender {
 		clock:        &clock,
 		rttStats:     rttStats,
 		packetNumber: 1,
+		estimator:    NewDeliveryRateEstimator(),
+		pktStates:    make(map[protocol.PacketNumber]pktSnapshot),
 		sender: NewBBRv3Sender(
 			&clock,
 			rttStats,
@@ -47,6 +59,11 @@ func newTestBBRSender() *testBBRSender {
 }
 
 func (s *testBBRSender) sendPacket() {
+	// Snapshot delivery state before send (mirrors sent_packet_handler).
+	appLimited := s.bytesInFlight < s.sender.GetCongestionWindow()
+	ds := s.estimator.OnPacketSent(s.clock.Now(), s.bytesInFlight, appLimited)
+	s.pktStates[s.packetNumber] = pktSnapshot{state: ds, sendTime: s.clock.Now()}
+
 	s.sender.OnPacketSent(s.clock.Now(), s.bytesInFlight, s.packetNumber, bbrTestMaxDatagramSize, true)
 	s.bytesInFlight += bbrTestMaxDatagramSize
 	s.packetNumber++
@@ -60,8 +77,21 @@ func (s *testBBRSender) sendNPackets(n int) {
 
 func (s *testBBRSender) ackNPackets(n int, rtt time.Duration) {
 	s.rttStats.UpdateRTT(rtt, 0)
+	var bestSample RateSample
 	for range n {
 		s.ackedPacketNumber++
+
+		// Generate delivery-rate sample (mirrors sent_packet_handler ACK path).
+		if snap, ok := s.pktStates[s.ackedPacketNumber]; ok {
+			sample := s.estimator.GenerateRateSample(
+				snap.state, snap.sendTime, bbrTestMaxDatagramSize, s.clock.Now(),
+			)
+			if sample.DeliveryRate > bestSample.DeliveryRate {
+				bestSample = sample
+			}
+			delete(s.pktStates, s.ackedPacketNumber)
+		}
+
 		s.sender.OnPacketAcked(
 			s.ackedPacketNumber,
 			bbrTestMaxDatagramSize,
@@ -71,6 +101,10 @@ func (s *testBBRSender) ackNPackets(n int, rtt time.Duration) {
 		if s.bytesInFlight >= bbrTestMaxDatagramSize {
 			s.bytesInFlight -= bbrTestMaxDatagramSize
 		}
+	}
+	// Feed the best sample to the bandwidth consumer.
+	if bestSample.DeliveryRate > 0 {
+		s.sender.OnBandwidthSample(bestSample)
 	}
 }
 

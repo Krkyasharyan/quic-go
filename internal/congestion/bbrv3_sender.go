@@ -153,6 +153,7 @@ type bbrv3Sender struct {
 var (
 	_ SendAlgorithm               = &bbrv3Sender{}
 	_ SendAlgorithmWithDebugInfos = &bbrv3Sender{}
+	_ BandwidthSampleConsumer     = &bbrv3Sender{}
 )
 
 // NewBBRv3Sender creates a new BBRv3 congestion controller.
@@ -248,8 +249,9 @@ func (b *bbrv3Sender) OnPacketAcked(
 	// 1. Advance round-trip counter.
 	b.updateRound(ackedPacketNumber)
 
-	// 2. Update bandwidth estimate.
-	b.updateBandwidthEstimate(ackedBytes, eventTime)
+	// 2. Bandwidth estimation is now handled by OnBandwidthSample,
+	//    called from the sent_packet_handler after computing a proper
+	//    delivery-rate sample across the entire ACK frame.
 
 	// 3. Update min RTT estimate.
 	b.updateMinRtt(eventTime)
@@ -390,18 +392,19 @@ func (b *bbrv3Sender) PacingRate() Bandwidth {
 
 // ---------- Bandwidth Estimation ----------
 
-func (b *bbrv3Sender) updateBandwidthEstimate(ackedBytes protocol.ByteCount, eventTime monotime.Time) {
-	// Compute an instantaneous delivery rate from the acked bytes and latest RTT.
-	rtt := b.rttStats.LatestRTT()
-	if rtt <= 0 {
+// OnBandwidthSample is called by the sent_packet_handler with the best
+// delivery-rate sample from an ACK frame. It replaces the old per-packet
+// ackedBytes/RTT heuristic with a proper delivery-rate estimate.
+func (b *bbrv3Sender) OnBandwidthSample(sample RateSample) {
+	// If the sample was taken during an app-limited period and the measured
+	// rate doesn't exceed our current best, discard it — we don't want
+	// idle periods to pollute the max-bandwidth filter.
+	if sample.IsAppLimited && sample.DeliveryRate <= b.btlBw {
 		return
 	}
 
-	deliveryRate := BandwidthFromDelta(ackedBytes, rtt)
-
 	// Update the windowed max filter (keyed by round count).
-	b.maxBwFilter.Update(int64(deliveryRate), b.roundCount)
-
+	b.maxBwFilter.Update(int64(sample.DeliveryRate), b.roundCount)
 	b.btlBw = Bandwidth(b.maxBwFilter.GetBest())
 }
 

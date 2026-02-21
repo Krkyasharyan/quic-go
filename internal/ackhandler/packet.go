@@ -25,6 +25,12 @@ type packet struct {
 
 	includedInBytesInFlight bool
 	isPathProbePacket       bool
+
+	// Delivery rate estimation: snapshot of connection-level state at send time.
+	deliveredAtSend     protocol.ByteCount // cumulative bytes delivered when this packet was sent
+	deliveredTimeAtSend monotime.Time      // deliveredTime when this packet was sent
+	firstSentTimeAtSend monotime.Time      // send time of first packet in flight when this was sent
+	isAppLimitedAtSend  bool               // whether the connection was app-limited at send time
 }
 
 func (p *packet) Outstanding() bool {
@@ -48,6 +54,10 @@ func getPacket() *packet {
 	p.IsPathMTUProbePacket = false
 	p.includedInBytesInFlight = false
 	p.isPathProbePacket = false
+	p.deliveredAtSend = 0
+	p.deliveredTimeAtSend = 0
+	p.firstSentTimeAtSend = 0
+	p.isAppLimitedAtSend = false
 	return p
 }
 

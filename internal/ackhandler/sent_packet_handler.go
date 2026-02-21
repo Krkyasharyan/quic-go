@@ -89,9 +89,10 @@ type sentPacketHandler struct {
 
 	bytesInFlight protocol.ByteCount
 
-	congestion congestion.SendAlgorithmWithDebugInfos
-	rttStats   *utils.RTTStats
-	connStats  *utils.ConnectionStats
+	congestion         congestion.SendAlgorithmWithDebugInfos
+	deliveryEstimator  *congestion.DeliveryRateEstimator
+	rttStats           *utils.RTTStats
+	connStats          *utils.ConnectionStats
 
 	// The number of times a PTO has been sent without receiving an ack.
 	ptoCount uint32
@@ -147,6 +148,7 @@ func NewSentPacketHandler(
 		rttStats:                       rttStats,
 		connStats:                      connStats,
 		congestion:                     cc,
+		deliveryEstimator:              congestion.NewDeliveryRateEstimator(),
 		ignorePacketsBelow:             ignorePacketsBelow,
 		perspective:                    pers,
 		qlogger:                        qlogger,
@@ -296,6 +298,17 @@ func (h *sentPacketHandler) SentPacket(
 			h.numProbesToSend--
 		}
 	}
+
+	// Snapshot delivery-rate state into the packet for later rate estimation.
+	// bytesInFlight here reflects the state *before* this packet (we want to
+	// detect a new flight when nothing was in flight before this send).
+	appLimited := isAckEliciting && h.bytesInFlight < h.congestion.GetCongestionWindow()
+	ds := h.deliveryEstimator.OnPacketSent(t, h.bytesInFlight-size, appLimited)
+	p.deliveredAtSend = ds.Delivered
+	p.deliveredTimeAtSend = ds.DeliveredTime
+	p.firstSentTimeAtSend = ds.FirstSentTime
+	p.isAppLimitedAtSend = ds.IsAppLimited
+
 	h.congestion.OnPacketSent(t, h.bytesInFlight, pn, size, isAckEliciting)
 
 	if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil {
@@ -435,9 +448,22 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 		h.detectLostPathProbes(rcvTime)
 	}
 	var acked1RTTPacket bool
+	var bestSample congestion.RateSample
 	for _, p := range ackedPackets {
 		if p.includedInBytesInFlight {
 			h.congestion.OnPacketAcked(p.PacketNumber, p.Length, priorInFlight, rcvTime)
+
+			// Compute a delivery-rate sample for this packet.
+			pktState := congestion.PacketDeliveryState{
+				Delivered:     p.deliveredAtSend,
+				DeliveredTime: p.deliveredTimeAtSend,
+				FirstSentTime: p.firstSentTimeAtSend,
+				IsAppLimited:  p.isAppLimitedAtSend,
+			}
+			sample := h.deliveryEstimator.GenerateRateSample(pktState, p.SendTime, p.Length, rcvTime)
+			if sample.DeliveryRate > bestSample.DeliveryRate {
+				bestSample = sample
+			}
 		}
 		if p.EncryptionLevel == protocol.Encryption1RTT {
 			acked1RTTPacket = true
@@ -445,6 +471,12 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 		h.removeFromBytesInFlight(p.packet)
 		if !p.isPathProbePacket {
 			putPacket(p.packet)
+		}
+	}
+	// Feed the best delivery-rate sample from this ACK to the congestion controller.
+	if bestSample.DeliveryRate > 0 {
+		if bsc, ok := h.congestion.(congestion.BandwidthSampleConsumer); ok {
+			bsc.OnBandwidthSample(bestSample)
 		}
 	}
 
@@ -1137,5 +1169,6 @@ func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSi
 		initialMaxDatagramSize,
 		h.qlogger,
 	)
+	h.deliveryEstimator = congestion.NewDeliveryRateEstimator()
 	h.setLossDetectionTimer(now)
 }
