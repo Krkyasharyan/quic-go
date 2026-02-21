@@ -335,40 +335,40 @@ func (b *bbrv3Sender) OnPacketAcked(
 
 // OnCongestionEvent is called when a packet is detected as lost.
 func (b *bbrv3Sender) OnCongestionEvent(
-	packetNumber protocol.PacketNumber,
-	lostBytes protocol.ByteCount,
-	priorInFlight protocol.ByteCount,
+  packetNumber protocol.PacketNumber,
+  lostBytes protocol.ByteCount,
+  priorInFlight protocol.ByteCount,
 ) {
-	b.connStats.PacketsLost.Add(1)
-	b.connStats.BytesLost.Add(uint64(lostBytes))
+  b.connStats.PacketsLost.Add(1)
+  b.connStats.BytesLost.Add(uint64(lostBytes))
 
-	// Track loss in this round for BBRv3 excessive-loss detection.
-	b.lossInRound += lostBytes
-	if b.inflightAtLoss == 0 || priorInFlight > b.inflightAtLoss {
-		b.inflightAtLoss = priorInFlight
-	}
+  b.lossInRound += lostBytes
+  if b.inflightAtLoss == 0 || priorInFlight > b.inflightAtLoss {
+    b.inflightAtLoss = priorInFlight
+  }
 
-	// Treat losses within the same cutback window as a single event.
-	if packetNumber <= b.largestSentAtLastCutback {
-		return
-	}
-	b.largestSentAtLastCutback = b.largestSentPacketNumber
+  if packetNumber <= b.largestSentAtLastCutback {
+    return
+  }
+  b.largestSentAtLastCutback = b.largestSentPacketNumber
 
-	switch b.mode {
-	case bbrStartup:
-		// BBRv3: loss in Startup sets inflight_hi as a cap, but does NOT
-		// trigger immediate exit. Startup exit remains bandwidth-plateau-only.
-		b.inflightHi = priorInFlight
-	case bbrProbeBW:
-		b.handleProbeBWLoss(priorInFlight)
-	case bbrDrain:
-		// No cwnd cut in Drain — we are already draining.
-	case bbrProbeRTT:
-		// Loss in ProbeRTT: cap inflight_hi as in Startup.
-		b.inflightHi = priorInFlight
-	}
+  switch b.mode {
+  case bbrStartup:
+    // FIX: Only cap the ceiling if the loss is actually excessive!
+    if b.isExcessiveLoss() {
+      b.inflightHi = priorInFlight
+    }
+  case bbrProbeBW:
+    b.handleProbeBWLoss(priorInFlight)
+  case bbrDrain:
+    // No cwnd cut in Drain.
+  case bbrProbeRTT:
+    if b.isExcessiveLoss() {
+      b.inflightHi = priorInFlight
+    }
+  }
 
-	b.maybeQlogStateChange(qlog.CongestionStateRecovery)
+  b.maybeQlogStateChange(qlog.CongestionStateRecovery)
 }
 
 // handleProbeBWLoss implements BBRv3 loss response during ProbeBW.
@@ -478,39 +478,24 @@ func (b *bbrv3Sender) GetCongestionWindow() protocol.ByteCount {
 // pacingRateBytesPerSec returns the pacing rate in bytes per second.
 // This is the callback passed to the pacer. It applies the death-zone clamp.
 func (b *bbrv3Sender) pacingRateBytesPerSec() uint64 {
-	bw := b.btlBw
-	if bw == 0 {
-		// Fallback: derive from initial cwnd / smoothed RTT.
-		srtt := b.rttStats.SmoothedRTT()
-		if srtt == 0 {
-			srtt = protocol.TimerGranularity
-		}
-		bw = BandwidthFromDelta(b.congestionWindow, srtt)
-	}
+  bw := b.btlBw
+  if bw == 0 {
+    srtt := b.rttStats.SmoothedRTT()
+    if srtt == 0 {
+      srtt = protocol.TimerGranularity
+    }
+    bw = BandwidthFromDelta(b.congestionWindow, srtt)
+  }
 
-	// Apply pacing gain. The result is in bits/s.
-	pacingBw := Bandwidth(float64(bw) * b.pacingGain)
+  pacingBw := Bandwidth(float64(bw) * b.pacingGain)
 
-	// Apply bwLo cap (set during loss events, cleared in REFILL).
-	if b.bwLo > 0 && pacingBw > b.bwLo {
-		pacingBw = b.bwLo
-	}
+  if b.bwLo > 0 && pacingBw > b.bwLo {
+    pacingBw = b.bwLo
+  }
 
-	// Convert to bytes/s.
-	bytesPerSec := uint64(pacingBw / BytesPerSecond)
-
-	// Death-zone clamp: avoid the QUIC critical jitter zone of 26–35 pps.
-	mtu := uint64(b.maxDatagramSize)
-	if mtu == 0 {
-		mtu = bbrDefaultMTU
-	}
-	pps := bytesPerSec / mtu
-	if pps >= bbrDeathZoneLowPPS && pps <= bbrDeathZoneHighPPS {
-		// Clamp down to safe zone: 25 pps.
-		bytesPerSec = bbrSafeZonePPS * mtu
-	}
-
-	return bytesPerSec
+  // FIX: Removed the artificial death-zone clamp. 
+  // We must allow the pacer to accelerate seamlessly to find the true BtlBw.
+  return uint64(pacingBw / BytesPerSecond)
 }
 
 // PacingRate returns the current pacing rate as a Bandwidth (bits/s).
@@ -739,37 +724,34 @@ func (b *bbrv3Sender) enterProbeBWUp(now monotime.Time) {
 // updateProbeBWPhase is called on each ACK while in ProbeBW mode.
 // It checks whether the current sub-phase should transition.
 func (b *bbrv3Sender) updateProbeBWPhase(eventTime monotime.Time, bytesInFlight protocol.ByteCount) {
-	switch b.probeBWPhase {
-	case probeBWDown:
-		// Exit DOWN when inflight ≤ BDP.
-		bdp := b.bdp()
-		if bdp > 0 && bytesInFlight <= bdp {
-			b.enterProbeBWCruise(eventTime)
-		}
-	case probeBWCruise:
-		// Exit CRUISE when the randomized timer fires.
-		if !b.probeBWCruiseDeadline.IsZero() && !eventTime.Before(b.probeBWCruiseDeadline) {
-			b.enterProbeBWRefill(eventTime)
-		}
-	case probeBWRefill:
-		// Exit REFILL after exactly one round has elapsed.
-		if b.roundCount > b.probeBWRefillRound {
-			b.enterProbeBWUp(eventTime)
-		}
-	case probeBWUp:
-		// Exit UP if: (a) bytesInFlight exceeds 1.25 × BDP, OR
-		// (b) a full round has elapsed.
-		bdp := b.bdp()
-		overshoot := bdp > 0 && bytesInFlight > protocol.ByteCount(float64(bdp)*bbrProbeBWUpPacingGain)
-		roundElapsed := b.roundCount > b.probeBWUpRound
-		if overshoot || (roundElapsed && bdp > 0) {
-			// If no excessive loss, raise inflight_hi to the current level.
-			if !b.isExcessiveLoss() && bytesInFlight > b.inflightHi {
-				b.inflightHi = bytesInFlight
-			}
-			b.enterProbeBWDown(eventTime)
-		}
-	}
+  switch b.probeBWPhase {
+  case probeBWDown:
+    bdp := b.bdp()
+    if bdp > 0 && bytesInFlight <= bdp {
+      b.enterProbeBWCruise(eventTime)
+    }
+  case probeBWCruise:
+    if !b.probeBWCruiseDeadline.IsZero() && !eventTime.Before(b.probeBWCruiseDeadline) {
+      b.enterProbeBWRefill(eventTime)
+    }
+  case probeBWRefill:
+    if b.roundCount > b.probeBWRefillRound {
+      b.enterProbeBWUp(eventTime)
+    }
+  case probeBWUp:
+    bdp := b.bdp()
+    overshoot := bdp > 0 && bytesInFlight > protocol.ByteCount(float64(bdp)*bbrProbeBWUpPacingGain)
+    roundElapsed := b.roundCount > b.probeBWUpRound
+    
+    if overshoot || (roundElapsed && bdp > 0) {
+      // FIX: Only update inflightHi if we ALREADY had a ceiling, and we safely proved we can push it higher.
+      // Do NOT accidentally lock an unlimited (0) ceiling down to a tiny bytesInFlight value.
+      if !b.isExcessiveLoss() && b.inflightHi > 0 && bytesInFlight > b.inflightHi {
+        b.inflightHi = bytesInFlight
+      }
+      b.enterProbeBWDown(eventTime)
+    }
+  }
 }
 
 // randomizedCruiseDuration returns a duration in [minRTT, 2×minRTT].
