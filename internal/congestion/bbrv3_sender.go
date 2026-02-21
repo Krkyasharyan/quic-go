@@ -192,6 +192,10 @@ type bbrv3Sender struct {
 
 	// --- qlog ---
 	lastState qlog.CongestionState
+
+	// --- Diagnostic logging ---
+	lastLogTime    time.Time // wall-clock of last diagnostic log line
+	lastSampleRate Bandwidth // delivery rate from most recent bandwidth sample (bits/s)
 }
 
 var (
@@ -309,13 +313,16 @@ func (b *bbrv3Sender) OnPacketAcked(
 		b.checkDrain(priorInFlight)
 	case bbrProbeBW:
 		b.updateProbeBWPhase(eventTime, priorInFlight)
-		b.maybeEnterProbeRTT(eventTime)
+		b.maybeEnterProbeRTT()
 	case bbrProbeRTT:
 		b.handleProbeRTT(eventTime, priorInFlight)
 	}
 
 	// 5. Update congestion window.
 	b.updateCwnd()
+
+	// 6. Diagnostic telemetry (throttled to ≤2 Hz).
+	b.logState(priorInFlight)
 }
 
 // OnCongestionEvent is called when a packet is detected as lost.
@@ -525,6 +532,9 @@ func (b *bbrv3Sender) OnBandwidthSample(sample RateSample) {
 	if sample.Delivered > b.lastDelivered {
 		b.lastDelivered = sample.Delivered
 	}
+
+	// Stash the latest sample rate for diagnostic logging.
+	b.lastSampleRate = sample.DeliveryRate
 }
 
 // ---------- RTT Estimation ----------
@@ -723,17 +733,17 @@ func (b *bbrv3Sender) randomizedCruiseDuration() time.Duration {
 
 // --- ProbeRTT ---
 
-func (b *bbrv3Sender) maybeEnterProbeRTT(eventTime monotime.Time) {
+func (b *bbrv3Sender) maybeEnterProbeRTT() {
 	if b.disableProbeRTT {
 		return
 	}
 	if !b.minRttExpired {
 		return
 	}
-	b.enterProbeRTT(eventTime)
+	b.enterProbeRTT()
 }
 
-func (b *bbrv3Sender) enterProbeRTT(eventTime monotime.Time) {
+func (b *bbrv3Sender) enterProbeRTT() {
 	b.mode = bbrProbeRTT
 	b.pacingGain = 1.0
 	b.priorCwnd = b.congestionWindow
@@ -862,6 +872,54 @@ func (b *bbrv3Sender) maxCongestionWindow() protocol.ByteCount {
 
 func (b *bbrv3Sender) minCongestionWindow() protocol.ByteCount {
 	return b.maxDatagramSize * bbrMinCongestionWindowPackets
+}
+
+// ---------- Diagnostic Telemetry ----------
+
+const bbrLogInterval = 500 * time.Millisecond
+
+// logState prints a single-line diagnostic snapshot of the BBR state machine.
+// It is throttled to fire at most once every 500 ms (wall-clock) so that it
+// does not measurably affect throughput or flood the console.
+func (b *bbrv3Sender) logState(bytesInFlight protocol.ByteCount) {
+	now := time.Now()
+	if now.Sub(b.lastLogTime) < bbrLogInterval {
+		return
+	}
+	b.lastLogTime = now
+
+	// Compute human-readable state label.
+	state := b.mode.String()
+	if b.mode == bbrProbeBW {
+		state = "ProbeBW_" + b.probeBWPhase.String()
+	}
+
+	// Delivery rate from last sample in KB/s.
+	sampleKBps := float64(b.lastSampleRate/BytesPerSecond) / 1024.0
+
+	// Windowed max bandwidth in KB/s.
+	btlKBps := float64(b.btlBw/BytesPerSecond) / 1024.0
+
+	// MinRTT in ms.
+	minRttMs := float64(b.minRtt) / float64(time.Millisecond)
+
+	// BDP in bytes.
+	bdp := b.bdp()
+
+	// Pacing rate in KB/s.
+	pacingKBps := float64(b.pacingRateBytesPerSec()) / 1024.0
+
+	// bwLo in KB/s (0 = uncapped).
+	bwLoKBps := float64(b.bwLo/BytesPerSecond) / 1024.0
+
+	fmt.Printf("[BBRv3] state=%-16s | sample=%8.1f KB/s  btlBw=%8.1f KB/s  minRTT=%6.1f ms | "+
+		"BDP=%8d  cwnd=%8d  inflight=%8d  pacing=%8.1f KB/s | "+
+		"inflightHi=%8d  inflightLo=%8d  bwLo=%8.1f KB/s  round=%d  lossRound=%d\n",
+		state,
+		sampleKBps, btlKBps, minRttMs,
+		bdp, b.congestionWindow, bytesInFlight, pacingKBps,
+		b.inflightHi, b.inflightLo, bwLoKBps, b.roundCount, b.lossInRound,
+	)
 }
 
 // ---------- qlog ----------
