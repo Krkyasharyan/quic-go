@@ -1105,3 +1105,112 @@ func TestBBRv3NormalOperationAfterAppLimitedPhase(t *testing.T) {
 	require.True(t, s.sender.btlBw >= savedBw,
 		"btlBw should recover after resuming full-rate sending")
 }
+
+// ---------- Delivery-Based Round Tracking ----------
+
+func TestBBRv3DeliveryBasedRoundTracking(t *testing.T) {
+	// Verify that rounds advance based on delivery progress, not per-ACK.
+	s := newTestBBRSender()
+	rtt := 50 * time.Millisecond
+
+	require.Equal(t, int64(0), s.sender.roundCount)
+
+	// Send and ACK one batch → should be round 1.
+	s.sendNPackets(10)
+	s.clock.Advance(rtt)
+	s.ackNPackets(10, rtt)
+	require.Equal(t, int64(1), s.sender.roundCount,
+		"first batch of ACKs should advance to round 1")
+
+	savedRound := s.sender.roundCount
+
+	// Send and ACK another batch → should be round 2.
+	s.sendNPackets(10)
+	s.clock.Advance(rtt)
+	s.ackNPackets(10, rtt)
+	require.Equal(t, savedRound+1, s.sender.roundCount,
+		"second batch should advance exactly one more round")
+}
+
+func TestBBRv3StartupNeedsThreePlateauRounds(t *testing.T) {
+	// STARTUP must NOT exit until 3 consecutive rounds without ≥25%
+	// bandwidth growth. With delivery-based round tracking, each
+	// send-ACK iteration at the same rate should count as one round.
+	s := newTestBBRSender()
+	rtt := 50 * time.Millisecond
+
+	require.Equal(t, bbrStartup, s.sender.Mode())
+
+	// Round 1: establish btlBw (fullBandwidth set, count=0).
+	s.sendNPackets(10)
+	s.clock.Advance(rtt)
+	s.ackNPackets(10, rtt)
+	require.Equal(t, bbrStartup, s.sender.Mode(), "should still be in Startup after round 1")
+	require.True(t, s.sender.btlBw > 0, "btlBw should be seeded")
+
+	// Rounds 2, 3: bandwidth ~same → fullBandwidthCount increments.
+	for i := 0; i < 2; i++ {
+		s.sendNPackets(10)
+		s.clock.Advance(rtt)
+		s.ackNPackets(10, rtt)
+		require.Equal(t, bbrStartup, s.sender.Mode(),
+			"should still be in Startup after round %d", i+2)
+	}
+	require.True(t, s.sender.fullBandwidthCount >= 1,
+		"fullBandwidthCount should have incremented")
+	require.True(t, s.sender.fullBandwidthCount < 3,
+		"fullBandwidthCount should be < 3 (need 3 consecutive plateau rounds)")
+
+	// Round 4: third consecutive plateau round → STARTUP exits.
+	s.sendNPackets(10)
+	s.clock.Advance(rtt)
+	s.ackNPackets(10, rtt)
+
+	// After 3 plateau rounds, mode should be Drain (or ProbeBW if Drain already exited).
+	require.NotEqual(t, bbrStartup, s.sender.Mode(),
+		"should have exited Startup after 3 plateau rounds (round ~4)")
+}
+
+func TestBBRv3StartupDoesNotExitOnSingleACK(t *testing.T) {
+	// The old packet-number-based round tracker could advance multiple
+	// rounds on a single ACK, causing STARTUP to exit prematurely.
+	// With delivery-based tracking, a single send-ACK cycle is one round.
+	s := newTestBBRSender()
+	rtt := 50 * time.Millisecond
+
+	// One send-ACK cycle should produce at most 1 round.
+	s.sendNPackets(10)
+	s.clock.Advance(rtt)
+	s.ackNPackets(10, rtt)
+
+	require.Equal(t, int64(1), s.sender.roundCount,
+		"single ACK cycle should be exactly one round")
+	require.Equal(t, bbrStartup, s.sender.Mode(),
+		"STARTUP must not exit after a single round")
+}
+
+func TestBBRv3StartupExitsOnBandwidthGrowth(t *testing.T) {
+	// Verify that STARTUP does NOT exit when bandwidth is still growing ≥25%.
+	s := newTestBBRSender()
+	rtt := 50 * time.Millisecond
+
+	// Round 1: small rate.
+	s.sendNPackets(2)
+	s.clock.Advance(rtt)
+	s.ackNPackets(2, rtt)
+	require.Equal(t, bbrStartup, s.sender.Mode())
+	savedBw := s.sender.btlBw
+
+	// Round 2: send more packets → higher delivery rate (more delivered in same RTT).
+	s.sendNPackets(10)
+	s.clock.Advance(rtt)
+	s.ackNPackets(10, rtt)
+
+	// If bandwidth grew ≥25%, fullBandwidthCount should be reset.
+	if s.sender.btlBw >= Bandwidth(float64(savedBw)*bbrStartupFullBandwidthThreshold) {
+		require.Equal(t, 0, s.sender.fullBandwidthCount,
+			"fullBandwidthCount should be 0 when bandwidth is still growing")
+		require.Equal(t, bbrStartup, s.sender.Mode(),
+			"STARTUP should continue when bandwidth is growing")
+	}
+}

@@ -158,7 +158,8 @@ type bbrv3Sender struct {
 	currentRoundTripEnd       protocol.PacketNumber
 	roundCount                int64
 	roundStart                bool
-	newRoundSinceLastBwSample bool // sticky flag: set in updateRound, consumed by OnBandwidthSample
+	newRoundSinceLastBwSample bool               // sticky: set in OnBandwidthSample on round advance, consumed by checkStartupFullBandwidth
+	nextRoundDelivered        protocol.ByteCount // cumulative delivered threshold — a new round starts when a sample's PriorDelivered ≥ this value
 
 	// --- Startup ---
 	fullBandwidth          Bandwidth // bandwidth at which we last declared "full"
@@ -530,6 +531,23 @@ func (b *bbrv3Sender) OnBandwidthSample(sample RateSample) {
 		b.lastDelivered = sample.Delivered
 	}
 
+	// Delivery-based round tracking (BBR RFC §4.5.2):
+	// A new round begins when we ACK a packet that was sent AFTER the
+	// current round started — its delivered-at-send (PriorDelivered) is ≥
+	// nextRoundDelivered. This replaces the old packet-number-based check
+	// which advanced rounds on every ACK frame, causing STARTUP to exit
+	// after only 1-2 ACKs before the 2.89× pacing ramp could execute.
+	if sample.PriorDelivered >= b.nextRoundDelivered {
+		b.nextRoundDelivered = sample.Delivered
+		b.roundCount++
+		b.newRoundSinceLastBwSample = true
+		// Reset per-round loss tracking at the start of each round.
+		b.lossInRound = 0
+		b.inflightAtLoss = 0
+		// Snapshot cumulative delivered at round start for loss rate calculation.
+		b.deliveredAtRoundStart = b.lastDelivered
+	}
+
 	// Stash the latest sample rate for diagnostic logging.
 	b.lastSampleRate = sample.DeliveryRate
 
@@ -545,6 +563,7 @@ func (b *bbrv3Sender) OnBandwidthSample(sample RateSample) {
 	if sample.IsAppLimited {
 		b.lastBwSampleAppLimited = true
 		if b.btlBw == 0 || sample.DeliveryRate <= b.btlBw {
+			b.newRoundSinceLastBwSample = false
 			return
 		}
 	} else {
@@ -600,16 +619,12 @@ func (b *bbrv3Sender) updateMinRtt(eventTime monotime.Time) {
 // ---------- Round Tracking ----------
 
 func (b *bbrv3Sender) updateRound(lastAckedPacket protocol.PacketNumber) {
+	// Lightweight packet-number-based round flag used only by ProbeRTT
+	// (handleProbeRTT checks roundStart to track a full round passing).
+	// Full delivery-based round tracking lives in OnBandwidthSample.
 	if lastAckedPacket > b.currentRoundTripEnd {
-		b.roundCount++
 		b.roundStart = true
-		b.newRoundSinceLastBwSample = true
 		b.currentRoundTripEnd = b.largestSentPacketNumber
-		// Reset per-round loss tracking at the start of each round.
-		b.lossInRound = 0
-		b.inflightAtLoss = 0
-		// Snapshot cumulative delivered at round start for loss rate calculation.
-		b.deliveredAtRoundStart = b.lastDelivered
 	} else {
 		b.roundStart = false
 	}
