@@ -3,6 +3,7 @@ package congestion
 import (
 	"fmt"
 	"math/rand"
+
 	// "os"
 	"time"
 
@@ -149,6 +150,14 @@ type bbrv3Sender struct {
 	probeBWRefillRound    int64         // round count at which REFILL was entered
 	probeBWUpRound        int64         // round count at which UP started
 	probeBWUpRounds       int64         // rounds elapsed while in UP (for max-rounds safety cap)
+
+	// --- ProbeBW cycle timeout (BBRv3 §4.3.3 BBRCheckTimeToProbeBW) ---
+	probeBWCycleStart monotime.Time // timestamp when the current DOWN→…→UP cycle began
+	bwProbeWait       time.Duration // randomized cycle timeout: 2s + rand [0, 1s]
+
+	// --- ProbeBW_UP inflight_hi probing (BBRv3 §4.3.3.5 additive increase) ---
+	probeBWUpAcks protocol.ByteCount // bytes ACKed during UP toward next inflight_hi raise
+	probeUpCnt    protocol.ByteCount // bytes ACKed per 1-MSS raise of inflight_hi
 
 	// --- BBRv3 Inflight / Bandwidth Bounds ---
 	inflightLo protocol.ByteCount // lower inflight bound (set during loss in CRUISE/DOWN)
@@ -334,6 +343,11 @@ func (b *bbrv3Sender) OnPacketAcked(
 		b.maybeEnterProbeRTT()
 	case bbrProbeRTT:
 		b.handleProbeRTT(eventTime, priorInFlight)
+	}
+
+	// 4.5 In ProbeBW_UP, raise inflight_hi incrementally (BBRv3 §4.3.3.5).
+	if b.mode == bbrProbeBW && b.probeBWPhase == probeBWUp {
+		b.probeInflightHiUpward(ackedBytes, priorInFlight)
 	}
 
 	// 5. Update congestion window.
@@ -717,8 +731,11 @@ func (b *bbrv3Sender) enterProbeBWDown(now monotime.Time) {
 	b.mode = bbrProbeBW
 	b.probeBWPhase = probeBWDown
 	b.probeBWPhaseStart = now
+	b.probeBWCycleStart = now               // cycle clock starts at DOWN entry
 	b.pacingGain = bbrProbeBWDownPacingGain // 0.9
 	b.cwndGain = bbrProbeBWCwndGain         // 2.0
+	// BBRv3 §4.3.3: randomized cycle timeout — escape DOWN/CRUISE after 2-3 s.
+	b.bwProbeWait = 2*time.Second + time.Duration(rand.Int63n(int64(time.Second)+1))
 	b.maybeQlogStateChange(qlog.CongestionStateCongestionAvoidance)
 }
 
@@ -755,6 +772,9 @@ func (b *bbrv3Sender) enterProbeBWUp(now monotime.Time) {
 	b.cwndGain = bbrProbeBWCwndGain       // 2.0
 	b.probeBWUpRound = b.roundCount
 	b.probeBWUpRounds = 0 // reset rounds-in-UP counter
+	// Initialize inflight_hi additive-increase state (BBRv3 §4.3.3.5).
+	b.probeBWUpAcks = 0
+	b.raiseInflightHiSlope()
 	b.maybeQlogStateChange(qlog.CongestionStateCongestionAvoidance)
 }
 
@@ -763,11 +783,19 @@ func (b *bbrv3Sender) enterProbeBWUp(now monotime.Time) {
 func (b *bbrv3Sender) updateProbeBWPhase(eventTime monotime.Time, bytesInFlight protocol.ByteCount) {
 	switch b.probeBWPhase {
 	case probeBWDown:
+		// BBRv3 §4.3.3: cycle timeout — escape DOWN directly to REFILL.
+		if b.checkTimeToProbeBW(eventTime) {
+			return
+		}
 		bdp := b.bdp()
 		if bdp > 0 && bytesInFlight <= bdp {
 			b.enterProbeBWCruise(eventTime)
 		}
 	case probeBWCruise:
+		// BBRv3 §4.3.3: cycle timeout also applies during CRUISE.
+		if b.checkTimeToProbeBW(eventTime) {
+			return
+		}
 		if !b.probeBWCruiseDeadline.IsZero() && !eventTime.Before(b.probeBWCruiseDeadline) {
 			b.enterProbeBWRefill(eventTime)
 		}
@@ -777,8 +805,13 @@ func (b *bbrv3Sender) updateProbeBWPhase(eventTime monotime.Time, bytesInFlight 
 		}
 	case probeBWUp:
 		// Track how many rounds we've spent in UP.
+		prevUpRounds := b.probeBWUpRounds
 		if b.roundCount > b.probeBWUpRound+b.probeBWUpRounds {
 			b.probeBWUpRounds = b.roundCount - b.probeBWUpRound
+		}
+		// If a new round started in UP, steepen the inflight_hi probing slope.
+		if b.probeBWUpRounds > prevUpRounds {
+			b.raiseInflightHiSlope()
 		}
 
 		bdp := b.bdp()
@@ -821,6 +854,58 @@ func (b *bbrv3Sender) randomizedCruiseDuration() time.Duration {
 	// rand in [0, minDur]
 	jitter := time.Duration(rand.Int63n(int64(minDur) + 1))
 	return minDur + jitter
+}
+
+// checkTimeToProbeBW implements BBRv3 §4.3.3 BBRCheckTimeToProbeBW.
+// If the cycle timeout (bwProbeWait) has elapsed since DOWN entry, bypass the
+// current DOWN/CRUISE phase and transition directly to REFILL. Returns true if
+// a transition was made.
+func (b *bbrv3Sender) checkTimeToProbeBW(now monotime.Time) bool {
+	if b.probeBWCycleStart.IsZero() || b.bwProbeWait <= 0 {
+		return false
+	}
+	if now.Sub(b.probeBWCycleStart) >= b.bwProbeWait {
+		b.enterProbeBWRefill(now)
+		return true
+	}
+	return false
+}
+
+// raiseInflightHiSlope updates the probing slope for inflight_hi growth.
+// Each round in ProbeBW_UP doubles the number of MSS added per round
+// (BBRv3 §4.3.3.5 BBRRaiseInflightHiSlope).
+func (b *bbrv3Sender) raiseInflightHiSlope() {
+	growthThisRound := protocol.ByteCount(1) << uint(min(b.probeBWUpRounds, 30))
+	b.probeUpCnt = max(b.congestionWindow/growthThisRound, 1)
+}
+
+// probeInflightHiUpward incrementally raises inflight_hi when the sender is
+// cwnd-limited during ProbeBW_UP (BBRv3 §4.3.3.5 BBRProbeInflightHiUpward).
+// This breaks the deadlock where cwnd is capped at inflight_hi: the cap itself
+// is raised, allowing the sender to gradually probe higher.
+func (b *bbrv3Sender) probeInflightHiUpward(ackedBytes protocol.ByteCount, priorInFlight protocol.ByteCount) {
+	// Only act during ProbeBW_UP.
+	if b.probeBWPhase != probeBWUp {
+		return
+	}
+	// No ceiling set yet — first UP cycle; ceiling will be set on exit.
+	if b.inflightHi == 0 {
+		return
+	}
+	// Only raise when cwnd-limited: prior inflight was near congestion window.
+	if priorInFlight < b.congestionWindow {
+		return
+	}
+	// Only raise when cwnd has reached the current ceiling.
+	if b.congestionWindow < b.inflightHi {
+		return
+	}
+	b.probeBWUpAcks += ackedBytes
+	if b.probeUpCnt > 0 && b.probeBWUpAcks >= b.probeUpCnt {
+		delta := b.probeBWUpAcks / b.probeUpCnt
+		b.probeBWUpAcks -= delta * b.probeUpCnt
+		b.inflightHi += delta * b.maxDatagramSize
+	}
 }
 
 // --- ProbeRTT ---

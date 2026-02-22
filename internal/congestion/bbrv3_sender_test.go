@@ -1240,3 +1240,115 @@ func TestBBRv3StartupExitsOnBandwidthGrowth(t *testing.T) {
 			"STARTUP should continue when bandwidth is growing")
 	}
 }
+
+// ---------- Phase 5: InflightHi Deadlock & DOWN Trap Fixes (BBRv3 §4.3.3) ----------
+
+func TestBBRv3InflightHiGrowsDuringUp(t *testing.T) {
+	// BBRv3 §4.3.3.5: During ProbeBW_UP, inflight_hi must be raised
+	// incrementally (additive increase) when the sender is cwnd-limited.
+	// This breaks the deadlock where cwnd is capped at a crushed inflight_hi.
+	s := newTestBBRSender()
+	rtt := 100 * time.Millisecond
+
+	// Drive to ProbeBW_UP.
+	s.driveToState(bbrProbeBW, rtt)
+	s.driveToProbeBWPhase(probeBWUp, rtt)
+	require.Equal(t, probeBWUp, s.sender.ProbeBWPhaseValue())
+
+	// Simulate a crushed inflight_hi: set it to a small value.
+	crushedHi := protocol.ByteCount(4) * bbrTestMaxDatagramSize
+	s.sender.inflightHi = crushedHi
+
+	// Force cwnd down to inflightHi (mimicking targetCwnd cap).
+	s.sender.congestionWindow = crushedHi
+
+	// Now send+ACK packets while cwnd-limited — inflight_hi probing should kick in.
+	// We need bytesInFlight >= congestionWindow for the priorInFlight check.
+	s.bytesInFlight = crushedHi // at the cwnd limit
+
+	for i := 0; i < 5; i++ {
+		s.clock.Advance(rtt)
+		// ACK one packet with priorInFlight == congestionWindow (cwnd-limited).
+		oldHi := s.sender.inflightHi
+		s.sender.OnPacketAcked(
+			s.packetNumber,
+			bbrTestMaxDatagramSize,
+			crushedHi, // priorInFlight == cwnd → cwnd-limited
+			s.clock.Now(),
+		)
+		s.packetNumber++
+
+		// After enough ACKs, inflight_hi should have grown.
+		if s.sender.inflightHi > oldHi {
+			break
+		}
+	}
+
+	require.Greater(t, s.sender.inflightHi, crushedHi,
+		"inflight_hi should grow via additive increase during ProbeBW_UP when cwnd-limited")
+}
+
+func TestBBRv3DownCycleTimeoutEscapesToRefill(t *testing.T) {
+	// BBRv3 §4.3.3 BBRCheckTimeToProbeBW: If bwProbeWait (2-3s) elapses
+	// while in ProbeBW_DOWN, the sender escapes directly to REFILL.
+	s := newTestBBRSender()
+	rtt := 100 * time.Millisecond
+
+	// Drive to ProbeBW (any phase).
+	s.driveToState(bbrProbeBW, rtt)
+	require.Equal(t, bbrProbeBW, s.sender.Mode())
+
+	// Manually enter DOWN with a fresh cycle timestamp so the timeout
+	// hasn't elapsed yet.
+	s.sender.enterProbeBWDown(s.clock.Now())
+	require.Equal(t, probeBWDown, s.sender.ProbeBWPhaseValue())
+
+	// Record the cycle start.
+	cycleStart := s.sender.probeBWCycleStart
+	require.False(t, cycleStart.IsZero(), "probeBWCycleStart should be set")
+	require.Greater(t, s.sender.bwProbeWait, time.Duration(0), "bwProbeWait should be set")
+
+	// Keep bytesInFlight above BDP so the inflight-based DOWN→CRUISE transition
+	// never fires — simulating the deadlock scenario.
+	s.bytesInFlight = s.sender.GetCongestionWindow() * 2
+
+	// Advance time well past bwProbeWait (use 4 seconds to cover max 3s timer).
+	s.clock.Advance(4 * time.Second)
+
+	// Send+ACK to trigger updateProbeBWPhase with the advanced clock.
+	s.sendNPackets(2)
+	s.clock.Advance(rtt)
+	s.ackNPackets(2, rtt)
+
+	// Should have escaped DOWN → REFILL (or already moved to UP).
+	phase := s.sender.ProbeBWPhaseValue()
+	require.True(t, phase == probeBWRefill || phase == probeBWUp,
+		"should escape DOWN via cycle timeout to REFILL (or UP): got %s", phase)
+}
+
+func TestBBRv3CruiseCycleTimeoutEscapesToRefill(t *testing.T) {
+	// The BBRv3 cycle timeout also applies during ProbeBW_CRUISE.
+	s := newTestBBRSender()
+	rtt := 100 * time.Millisecond
+
+	// Drive to ProbeBW_CRUISE.
+	s.driveToState(bbrProbeBW, rtt)
+	s.driveToProbeBWPhase(probeBWCruise, rtt)
+	require.Equal(t, probeBWCruise, s.sender.ProbeBWPhaseValue())
+
+	// Set a very long CRUISE deadline so the normal transition doesn't fire.
+	s.sender.probeBWCruiseDeadline = s.clock.Now().Add(1 * time.Hour)
+
+	// Advance past the cycle timeout (bwProbeWait was set in enterProbeBWDown).
+	s.clock.Advance(4 * time.Second)
+
+	// Trigger phase check.
+	s.sendNPackets(2)
+	s.clock.Advance(rtt)
+	s.ackNPackets(2, rtt)
+
+	// Should have escaped CRUISE → REFILL (or already moved to UP).
+	phase := s.sender.ProbeBWPhaseValue()
+	require.True(t, phase == probeBWRefill || phase == probeBWUp,
+		"should escape CRUISE via cycle timeout to REFILL (or UP): got %s", phase)
+}
