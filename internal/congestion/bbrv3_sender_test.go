@@ -1352,3 +1352,128 @@ func TestBBRv3CruiseCycleTimeoutEscapesToRefill(t *testing.T) {
 	require.True(t, phase == probeBWRefill || phase == probeBWUp,
 		"should escape CRUISE via cycle timeout to REFILL (or UP): got %s", phase)
 }
+
+// ---------- Phase 6: BDP Floor & Drain Hardening ----------
+
+func TestBBRv3DownExitUsesBdpFloor(t *testing.T) {
+	// When btlBw collapses so that bdp() < minCwnd, the DOWN exit condition
+	// must use minCwnd as the drain target (bdpFloor). Otherwise inflight can
+	// never reach the microscopic BDP and the sender is permanently trapped.
+	s := newTestBBRSender()
+	rtt := 100 * time.Millisecond
+
+	// Drive to ProbeBW.
+	s.driveToState(bbrProbeBW, rtt)
+
+	// Manually enter DOWN with a fresh cycle timestamp.
+	s.sender.enterProbeBWDown(s.clock.Now())
+	require.Equal(t, probeBWDown, s.sender.ProbeBWPhaseValue())
+
+	// Crush btlBw so that bdp() returns a value far below minCwnd.
+	// minCwnd = 4 * 1280 = 5120 bytes.
+	// Set btlBw so that bdp = btlBw_bytes_per_sec * minRtt / 1s ≈ 100 bytes.
+	// 100 bytes/s in Bandwidth units: 100 * 8 bits/s = 800 bits/s.
+	s.sender.btlBw = 800 * BytesPerSecond // ~800 bytes/s → BDP = 800 * 0.1 = 80 bytes
+	s.sender.maxBwFilter.Reset(int64(s.sender.btlBw), s.sender.roundCount)
+
+	rawBdp := s.sender.bdp()
+	require.Less(t, rawBdp, s.sender.minCongestionWindow(),
+		"bdp() should be less than minCwnd for this test to be meaningful")
+
+	// Set bytesInFlight so that after sendNPackets(1) adds 1 MTU, priorInFlight
+	// at ACK time equals minCwnd — i.e. exactly at the bdpFloor target.
+	s.bytesInFlight = s.sender.minCongestionWindow() - bbrTestMaxDatagramSize
+
+	// ACK a packet to trigger updateProbeBWPhase.
+	s.sendNPackets(1)
+	s.clock.Advance(rtt)
+	s.ackNPackets(1, rtt)
+
+	// Should have exited DOWN to CRUISE (or beyond) since bytesInFlight <= bdpFloor.
+	phase := s.sender.ProbeBWPhaseValue()
+	require.NotEqual(t, probeBWDown, phase,
+		"DOWN should exit when bytesInFlight <= bdpFloor (minCwnd), not stay trapped: got %s", phase)
+}
+
+func TestBBRv3DrainExitUsesBdpFloor(t *testing.T) {
+	// Same bdpFloor fix applies to Drain: when BDP < minCwnd, the drain
+	// target should be minCwnd so Drain doesn't get stuck.
+	s := newTestBBRSender()
+	rtt := 100 * time.Millisecond
+
+	// Drive through Startup to Drain.
+	s.driveToState(bbrDrain, rtt)
+	require.Equal(t, bbrDrain, s.sender.Mode())
+
+	// Crush btlBw to make bdp() microscopic.
+	s.sender.btlBw = 800 * BytesPerSecond
+	s.sender.maxBwFilter.Reset(int64(s.sender.btlBw), s.sender.roundCount)
+
+	rawBdp := s.sender.bdp()
+	require.Less(t, rawBdp, s.sender.minCongestionWindow(),
+		"bdp() should be less than minCwnd for this test")
+
+	// Set bytesInFlight so that after sendNPackets(1) adds 1 MTU, priorInFlight
+	// at ACK time equals minCwnd — satisfying the floored drain target.
+	s.bytesInFlight = s.sender.minCongestionWindow() - bbrTestMaxDatagramSize
+
+	// Trigger checkDrain via OnPacketAcked.
+	s.sendNPackets(1)
+	s.clock.Advance(rtt)
+	s.ackNPackets(1, rtt)
+
+	// Should have exited Drain to ProbeBW.
+	require.Equal(t, bbrProbeBW, s.sender.Mode(),
+		"Drain should exit to ProbeBW when bytesInFlight <= bdpFloor (minCwnd)")
+}
+
+func TestBBRv3DrainTimeoutEscape(t *testing.T) {
+	// Defense-in-depth: Drain has a time-based escape of max(3s, 10×minRTT).
+	s := newTestBBRSender()
+	rtt := 100 * time.Millisecond
+
+	// Drive to Drain.
+	s.driveToState(bbrDrain, rtt)
+	require.Equal(t, bbrDrain, s.sender.Mode())
+
+	// Keep bytesInFlight high so the inflight-based exit never fires.
+	s.bytesInFlight = s.sender.GetCongestionWindow() * 3
+
+	// Advance time past the drain timeout (3 seconds).
+	s.clock.Advance(4 * time.Second)
+
+	// Trigger checkDrain.
+	s.sendNPackets(1)
+	s.clock.Advance(rtt)
+	s.ackNPackets(1, rtt)
+
+	// Should have escaped Drain via timeout.
+	require.Equal(t, bbrProbeBW, s.sender.Mode(),
+		"Drain should escape to ProbeBW via timeout when inflight stays high")
+}
+
+func TestBBRv3BdpFloorNeverBelowMinCwnd(t *testing.T) {
+	// bdpFloor() must always return at least minCongestionWindow().
+	s := newTestBBRSender()
+
+	// Case 1: btlBw = 0, minRtt = 0 (BDP unknown).
+	s.sender.btlBw = 0
+	s.sender.minRtt = 0
+	floor := s.sender.bdpFloor()
+	require.GreaterOrEqual(t, floor, s.sender.minCongestionWindow(),
+		"bdpFloor should be >= minCwnd even when BDP is unknown")
+
+	// Case 2: btlBw is set but produces microscopic BDP.
+	s.sender.btlBw = 100 * BytesPerSecond
+	s.sender.minRtt = 1 * time.Millisecond // BDP ≈ 0.1 bytes → truncated to 0
+	floor = s.sender.bdpFloor()
+	require.GreaterOrEqual(t, floor, s.sender.minCongestionWindow(),
+		"bdpFloor should be >= minCwnd when BDP is microscopic")
+
+	// Case 3: btlBw produces healthy BDP above minCwnd.
+	s.sender.btlBw = 10_000_000 * BytesPerSecond // 10 MB/s
+	s.sender.minRtt = 100 * time.Millisecond     // BDP = 1 MB
+	floor = s.sender.bdpFloor()
+	require.Greater(t, floor, s.sender.minCongestionWindow(),
+		"bdpFloor should be the actual BDP when it exceeds minCwnd")
+}

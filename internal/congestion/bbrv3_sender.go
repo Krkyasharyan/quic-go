@@ -187,6 +187,9 @@ type bbrv3Sender struct {
 	startupFullBWReached   bool
 	lastBwSampleAppLimited bool // whether the most recent OnBandwidthSample was app-limited
 
+	// --- Drain timeout ---
+	drainStart monotime.Time // timestamp at which Drain was entered
+
 	// --- Loss tracking for current round ---
 	lossInRound    protocol.ByteCount // bytes lost in current round
 	inflightAtLoss protocol.ByteCount // bytes in flight when loss was detected
@@ -708,20 +711,31 @@ func (b *bbrv3Sender) enterDrain() {
 	b.mode = bbrDrain
 	b.pacingGain = bbrDrainPacingGain
 	b.cwndGain = bbrStartupCwndGain // keep cwnd high during drain
+	b.drainStart = b.clock.Now()    // arm Drain timeout
 	b.maybeQlogStateChange(qlog.CongestionStateCongestionAvoidance)
 }
 
 // --- Drain ---
 
 func (b *bbrv3Sender) checkDrain(bytesInFlight protocol.ByteCount) {
-	// BBRv3: Drain exits when bytes in flight ≤ BDP.
-	// Transition to ProbeBW_DOWN (not CRUISE) to start a clean probe cycle.
-	bdp := b.bdp()
-	if bdp == 0 {
-		bdp = b.targetCwnd() // fallback when BDP can't be computed
-	}
-	if bytesInFlight <= bdp {
+	// BBRv3: Drain exits when bytes in flight ≤ BDP, floored at minCwnd.
+	// The sender physically cannot reduce inflight below minCongestionWindow,
+	// so a drain target smaller than that creates an unreachable exit.
+	drainTarget := b.bdpFloor()
+	if bytesInFlight <= drainTarget {
 		b.enterProbeBWDown(b.clock.Now())
+		return
+	}
+	// Defense-in-depth: time-based Drain escape. If we've been draining for
+	// longer than max(3s, 10×minRTT), force exit to ProbeBW_DOWN.
+	if !b.drainStart.IsZero() {
+		drainTimeout := 3 * time.Second
+		if rttTimeout := 10 * b.minRtt; rttTimeout > drainTimeout {
+			drainTimeout = rttTimeout
+		}
+		if b.clock.Now().Sub(b.drainStart) >= drainTimeout {
+			b.enterProbeBWDown(b.clock.Now())
+		}
 	}
 }
 
@@ -787,8 +801,10 @@ func (b *bbrv3Sender) updateProbeBWPhase(eventTime monotime.Time, bytesInFlight 
 		if b.checkTimeToProbeBW(eventTime) {
 			return
 		}
-		bdp := b.bdp()
-		if bdp > 0 && bytesInFlight <= bdp {
+		// Drain target is BDP floored at minCwnd (since the sender physically
+		// cannot reduce inflight below minCongestionWindow).
+		drainTarget := b.bdpFloor()
+		if bytesInFlight <= drainTarget {
 			b.enterProbeBWCruise(eventTime)
 		}
 	case probeBWCruise:
@@ -979,6 +995,22 @@ func (b *bbrv3Sender) bdp() protocol.ByteCount {
 	}
 	bdpBytesPerSec := uint64(b.btlBw / BytesPerSecond)
 	return protocol.ByteCount(bdpBytesPerSec * uint64(b.minRtt) / uint64(time.Second))
+}
+
+// bdpFloor returns the BDP for drain-target comparisons, floored at
+// minCongestionWindow(). The sender physically cannot reduce its inflight data
+// below minCwnd, so any drain target smaller than that creates a mathematically
+// impossible exit condition and a permanent state-machine trap.
+func (b *bbrv3Sender) bdpFloor() protocol.ByteCount {
+	bdp := b.bdp()
+	if bdp == 0 {
+		// BDP unknown: use targetCwnd() which has its own fallback chain.
+		bdp = b.targetCwnd()
+	}
+	if bdp < b.minCongestionWindow() {
+		bdp = b.minCongestionWindow()
+	}
+	return bdp
 }
 
 func (b *bbrv3Sender) targetCwnd() protocol.ByteCount {
