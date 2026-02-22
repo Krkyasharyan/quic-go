@@ -112,6 +112,9 @@ const (
 	bbrDeathZoneHighPPS = 35
 	bbrSafeZonePPS      = 25
 
+	// Maximum rounds to stay in ProbeBW_UP before forcing exit (BBRv3 §4.3.3.5).
+	bbrProbeBWUpMaxRounds = 30
+
 	// Default MTU for QUIC.
 	bbrDefaultMTU = 1200
 )
@@ -138,6 +141,7 @@ type bbrv3Sender struct {
 	probeBWCruiseDeadline monotime.Time // randomized CRUISE→REFILL transition time
 	probeBWRefillRound    int64         // round count at which REFILL was entered
 	probeBWUpRound        int64         // round count at which UP started
+	probeBWUpRounds       int64         // rounds elapsed while in UP (for max-rounds safety cap)
 
 	// --- BBRv3 Inflight / Bandwidth Bounds ---
 	inflightLo protocol.ByteCount // lower inflight bound (set during loss in CRUISE/DOWN)
@@ -195,10 +199,6 @@ type bbrv3Sender struct {
 
 	// --- qlog ---
 	lastState qlog.CongestionState
-
-	// --- Diagnostic logging ---
-	lastLogTime    time.Time // wall-clock of last diagnostic log line
-	lastSampleRate Bandwidth // delivery rate from most recent bandwidth sample (bits/s)
 }
 
 var (
@@ -335,40 +335,40 @@ func (b *bbrv3Sender) OnPacketAcked(
 
 // OnCongestionEvent is called when a packet is detected as lost.
 func (b *bbrv3Sender) OnCongestionEvent(
-  packetNumber protocol.PacketNumber,
-  lostBytes protocol.ByteCount,
-  priorInFlight protocol.ByteCount,
+	packetNumber protocol.PacketNumber,
+	lostBytes protocol.ByteCount,
+	priorInFlight protocol.ByteCount,
 ) {
-  b.connStats.PacketsLost.Add(1)
-  b.connStats.BytesLost.Add(uint64(lostBytes))
+	b.connStats.PacketsLost.Add(1)
+	b.connStats.BytesLost.Add(uint64(lostBytes))
 
-  b.lossInRound += lostBytes
-  if b.inflightAtLoss == 0 || priorInFlight > b.inflightAtLoss {
-    b.inflightAtLoss = priorInFlight
-  }
+	b.lossInRound += lostBytes
+	if b.inflightAtLoss == 0 || priorInFlight > b.inflightAtLoss {
+		b.inflightAtLoss = priorInFlight
+	}
 
-  if packetNumber <= b.largestSentAtLastCutback {
-    return
-  }
-  b.largestSentAtLastCutback = b.largestSentPacketNumber
+	if packetNumber <= b.largestSentAtLastCutback {
+		return
+	}
+	b.largestSentAtLastCutback = b.largestSentPacketNumber
 
-  switch b.mode {
-  case bbrStartup:
-    // FIX: Only cap the ceiling if the loss is actually excessive!
-    if b.isExcessiveLoss() {
-      b.inflightHi = priorInFlight
-    }
-  case bbrProbeBW:
-    b.handleProbeBWLoss(priorInFlight)
-  case bbrDrain:
-    // No cwnd cut in Drain.
-  case bbrProbeRTT:
-    if b.isExcessiveLoss() {
-      b.inflightHi = priorInFlight
-    }
-  }
+	switch b.mode {
+	case bbrStartup:
+		// FIX: Only cap the ceiling if the loss is actually excessive!
+		if b.isExcessiveLoss() {
+			b.inflightHi = priorInFlight
+		}
+	case bbrProbeBW:
+		b.handleProbeBWLoss(priorInFlight)
+	case bbrDrain:
+		// No cwnd cut in Drain.
+	case bbrProbeRTT:
+		if b.isExcessiveLoss() {
+			b.inflightHi = priorInFlight
+		}
+	}
 
-  b.maybeQlogStateChange(qlog.CongestionStateRecovery)
+	b.maybeQlogStateChange(qlog.CongestionStateRecovery)
 }
 
 // handleProbeBWLoss implements BBRv3 loss response during ProbeBW.
@@ -432,19 +432,19 @@ func (b *bbrv3Sender) currentLossRate() float64 {
 // at the current cwnd and transitions to ProbeBW_DOWN to re-probe gracefully.
 // This preserves btlBw and minRtt estimates.
 func (b *bbrv3Sender) OnRetransmissionTimeout(packetsRetransmitted bool) {
-  if !packetsRetransmitted {
-    return
-  }
-  if b.congestionWindow > 0 {
-    b.inflightHi = b.congestionWindow
-  }
-  
-  // FIX: Only transition to DOWN if we are already in the steady-state. 
-  // Do NOT abort the exponential STARTUP phase due to a normal handshake PTO!
-  if b.mode != bbrStartup {
-    b.enterProbeBWDown(b.clock.Now())
-  }
-  b.largestSentAtLastCutback = protocol.InvalidPacketNumber
+	if !packetsRetransmitted {
+		return
+	}
+	if b.congestionWindow > 0 {
+		b.inflightHi = b.congestionWindow
+	}
+
+	// FIX: Only transition to DOWN if we are already in the steady-state.
+	// Do NOT abort the exponential STARTUP phase due to a normal handshake PTO!
+	if b.mode != bbrStartup {
+		b.enterProbeBWDown(b.clock.Now())
+	}
+	b.largestSentAtLastCutback = protocol.InvalidPacketNumber
 }
 
 // SetMaxDatagramSize updates the MTU.
@@ -483,30 +483,42 @@ func (b *bbrv3Sender) GetCongestionWindow() protocol.ByteCount {
 // pacingRateBytesPerSec returns the pacing rate in bytes per second.
 // This is the callback passed to the pacer. It applies the death-zone clamp.
 func (b *bbrv3Sender) pacingRateBytesPerSec() uint64 {
-  bw := b.btlBw
-  srtt := b.rttStats.SmoothedRTT()
-  if srtt == 0 {
-    srtt = protocol.TimerGranularity
-  }
+	bw := b.btlBw
+	srtt := b.rttStats.SmoothedRTT()
+	if srtt == 0 {
+		srtt = protocol.TimerGranularity
+	}
 
-  // Calculate the bandwidth required to empty the current cwnd in one RTT.
-  cwndBw := BandwidthFromDelta(b.congestionWindow, srtt)
+	// Calculate the bandwidth required to empty the current cwnd in one RTT.
+	cwndBw := BandwidthFromDelta(b.congestionWindow, srtt)
 
-  // FIX: The Pacing Bootstrapper.
-  // If our measured bandwidth is smaller than what our cwnd allows, we are 
-  // trapped in an artificial pacing chokehold. Always use the larger of the two.
-  if bw < cwndBw {
-    bw = cwndBw
-  }
+	// FIX: The Pacing Bootstrapper.
+	// If our measured bandwidth is smaller than what our cwnd allows, we are
+	// trapped in an artificial pacing chokehold. Always use the larger of the two.
+	if bw < cwndBw {
+		bw = cwndBw
+	}
 
-  pacingBw := Bandwidth(float64(bw) * b.pacingGain)
+	// Apply bwLo cap to the base bandwidth BEFORE gain multiplication (BBRv3 spec:
+	// BBR.bw = min(max_bw, bw_lo) → pacing_rate = BBR.bw × pacing_gain).
+	if b.bwLo > 0 && bw > b.bwLo {
+		bw = b.bwLo
+	}
 
-  // Apply bwLo cap
-  if b.bwLo > 0 && pacingBw > b.bwLo {
-    pacingBw = b.bwLo
-  }
+	pacingBw := Bandwidth(float64(bw) * b.pacingGain)
 
-  return uint64(pacingBw / BytesPerSecond)
+	// Death-zone clamp: if the pacing rate falls into the QUIC jitter zone
+	// (26–35 pps), clamp down to the safe zone (25 pps) to avoid retransmit storms.
+	pacingBytesPerSec := uint64(pacingBw / BytesPerSecond)
+	if b.maxDatagramSize > 0 {
+		pps := pacingBytesPerSec / uint64(b.maxDatagramSize)
+		if pps >= bbrDeathZoneLowPPS && pps <= bbrDeathZoneHighPPS {
+			pacingBytesPerSec = bbrSafeZonePPS * uint64(b.maxDatagramSize)
+			return pacingBytesPerSec
+		}
+	}
+
+	return pacingBytesPerSec
 }
 
 // PacingRate returns the current pacing rate as a Bandwidth (bits/s).
@@ -543,9 +555,6 @@ func (b *bbrv3Sender) OnBandwidthSample(sample RateSample) {
 		// Snapshot cumulative delivered at round start for loss rate calculation.
 		b.deliveredAtRoundStart = b.lastDelivered
 	}
-
-	// Stash the latest sample rate for diagnostic logging.
-	b.lastSampleRate = sample.DeliveryRate
 
 	// BBRv3 strict app-limited filtering:
 	// If the sample was taken during an app-limited period, it reflects
@@ -632,44 +641,43 @@ func (b *bbrv3Sender) updateRound(lastAckedPacket protocol.PacketNumber) {
 
 func (b *bbrv3Sender) checkStartupDone() {
 	if b.startupFullBWReached {
-		b.enterDrain()
-		return
+		return // enterDrain is called from checkStartupFullBandwidth
 	}
 	b.checkStartupFullBandwidth()
 }
 
 func (b *bbrv3Sender) checkStartupFullBandwidth() {
-  if !b.newRoundSinceLastBwSample {
-    return
-  }
+	if !b.newRoundSinceLastBwSample {
+		return
+	}
 
-  if b.lastBwSampleAppLimited {
-    return
-  }
+	if b.lastBwSampleAppLimited {
+		return
+	}
 
-  // FIX: The Premature Exit Guard.
-  // Do not allow Startup to exit if our Congestion Window or BDP hasn't 
-  // even grown past the initial starting value. 
-  initialCwnd := protocol.ByteCount(bbrInitialCongestionWindowPackets) * b.maxDatagramSize
-  if b.congestionWindow <= initialCwnd && b.bdp() <= initialCwnd {
-    b.fullBandwidth = b.btlBw
-    b.fullBandwidthCount = 0
-    return
-  }
+	// FIX: The Premature Exit Guard.
+	// Do not allow Startup to exit if our Congestion Window or BDP hasn't
+	// even grown past the initial starting value.
+	initialCwnd := protocol.ByteCount(bbrInitialCongestionWindowPackets) * b.maxDatagramSize
+	if b.congestionWindow <= initialCwnd && b.bdp() <= initialCwnd {
+		b.fullBandwidth = b.btlBw
+		b.fullBandwidthCount = 0
+		return
+	}
 
-  target := Bandwidth(float64(b.fullBandwidth) * bbrStartupFullBandwidthThreshold)
-  if b.btlBw >= target {
-    // Still growing — reset the counter.
-    b.fullBandwidth = b.btlBw
-    b.fullBandwidthCount = 0
-    return
-  }
+	target := Bandwidth(float64(b.fullBandwidth) * bbrStartupFullBandwidthThreshold)
+	if b.btlBw >= target {
+		// Still growing — reset the counter.
+		b.fullBandwidth = b.btlBw
+		b.fullBandwidthCount = 0
+		return
+	}
 
-  b.fullBandwidthCount++
-  if b.fullBandwidthCount >= bbrStartupFullBandwidthRounds {
-    b.startupFullBWReached = true
-    b.enterDrain()
-  }
+	b.fullBandwidthCount++
+	if b.fullBandwidthCount >= bbrStartupFullBandwidthRounds {
+		b.startupFullBWReached = true
+		b.enterDrain()
+	}
 }
 
 func (b *bbrv3Sender) enterDrain() {
@@ -683,12 +691,13 @@ func (b *bbrv3Sender) enterDrain() {
 
 func (b *bbrv3Sender) checkDrain(bytesInFlight protocol.ByteCount) {
 	// BBRv3: Drain exits when bytes in flight ≤ BDP.
+	// Transition to ProbeBW_DOWN (not CRUISE) to start a clean probe cycle.
 	bdp := b.bdp()
 	if bdp == 0 {
 		bdp = b.targetCwnd() // fallback when BDP can't be computed
 	}
 	if bytesInFlight <= bdp {
-		b.enterProbeBWCruise(b.clock.Now())
+		b.enterProbeBWDown(b.clock.Now())
 	}
 }
 
@@ -735,40 +744,62 @@ func (b *bbrv3Sender) enterProbeBWUp(now monotime.Time) {
 	b.pacingGain = bbrProbeBWUpPacingGain // 1.25
 	b.cwndGain = bbrProbeBWCwndGain       // 2.0
 	b.probeBWUpRound = b.roundCount
+	b.probeBWUpRounds = 0 // reset rounds-in-UP counter
 	b.maybeQlogStateChange(qlog.CongestionStateCongestionAvoidance)
 }
 
 // updateProbeBWPhase is called on each ACK while in ProbeBW mode.
 // It checks whether the current sub-phase should transition.
 func (b *bbrv3Sender) updateProbeBWPhase(eventTime monotime.Time, bytesInFlight protocol.ByteCount) {
-  switch b.probeBWPhase {
-  case probeBWDown:
-    bdp := b.bdp()
-    if bdp > 0 && bytesInFlight <= bdp {
-      b.enterProbeBWCruise(eventTime)
-    }
-  case probeBWCruise:
-    if !b.probeBWCruiseDeadline.IsZero() && !eventTime.Before(b.probeBWCruiseDeadline) {
-      b.enterProbeBWRefill(eventTime)
-    }
-  case probeBWRefill:
-    if b.roundCount > b.probeBWRefillRound {
-      b.enterProbeBWUp(eventTime)
-    }
-  case probeBWUp:
-    bdp := b.bdp()
-    overshoot := bdp > 0 && bytesInFlight > protocol.ByteCount(float64(bdp)*bbrProbeBWUpPacingGain)
-    roundElapsed := b.roundCount > b.probeBWUpRound
-    
-    if overshoot || (roundElapsed && bdp > 0) {
-      // FIX: Only update inflightHi if we ALREADY had a ceiling, and we safely proved we can push it higher.
-      // Do NOT accidentally lock an unlimited (0) ceiling down to a tiny bytesInFlight value.
-      if !b.isExcessiveLoss() && b.inflightHi > 0 && bytesInFlight > b.inflightHi {
-        b.inflightHi = bytesInFlight
-      }
-      b.enterProbeBWDown(eventTime)
-    }
-  }
+	switch b.probeBWPhase {
+	case probeBWDown:
+		bdp := b.bdp()
+		if bdp > 0 && bytesInFlight <= bdp {
+			b.enterProbeBWCruise(eventTime)
+		}
+	case probeBWCruise:
+		if !b.probeBWCruiseDeadline.IsZero() && !eventTime.Before(b.probeBWCruiseDeadline) {
+			b.enterProbeBWRefill(eventTime)
+		}
+	case probeBWRefill:
+		if b.roundCount > b.probeBWRefillRound {
+			b.enterProbeBWUp(eventTime)
+		}
+	case probeBWUp:
+		// Track how many rounds we've spent in UP.
+		if b.roundCount > b.probeBWUpRound+b.probeBWUpRounds {
+			b.probeBWUpRounds = b.roundCount - b.probeBWUpRound
+		}
+
+		bdp := b.bdp()
+		overshoot := bdp > 0 && bytesInFlight > protocol.ByteCount(float64(bdp)*bbrProbeBWUpPacingGain)
+
+		// BBRv3 §4.3.3.5: Exit UP when:
+		//   (a) inflight > inflightHi and inflightHi is set, OR
+		//   (b) excessive loss/ECN detected in this round, OR
+		//   (c) safety cap: stayed in UP for >= bbrProbeBWUpMaxRounds rounds.
+		exitBecauseLoss := b.isExcessiveLoss() && b.probeBWUpRounds >= 1
+		exitBecauseCeiling := b.inflightHi > 0 && bytesInFlight > b.inflightHi
+		exitBecauseMaxRounds := b.probeBWUpRounds >= bbrProbeBWUpMaxRounds
+
+		if exitBecauseLoss || exitBecauseCeiling || exitBecauseMaxRounds {
+			// On normal (non-loss) exit, unconditionally raise inflightHi to the
+			// achieved inflight level. This calibrates the ceiling from both
+			// unlimited (0) and previously-set states.
+			if !b.isExcessiveLoss() {
+				if b.inflightHi == 0 || bytesInFlight > b.inflightHi {
+					b.inflightHi = bytesInFlight
+				}
+			}
+			b.enterProbeBWDown(eventTime)
+		} else if overshoot {
+			// Overshoot means the probe succeeded in pushing inflight above BDP×1.25.
+			// Raise the ceiling but keep probing — don't exit yet.
+			if b.inflightHi == 0 || bytesInFlight > b.inflightHi {
+				b.inflightHi = bytesInFlight
+			}
+		}
+	}
 }
 
 // randomizedCruiseDuration returns a duration in [minRTT, 2×minRTT].
@@ -840,8 +871,8 @@ func (b *bbrv3Sender) exitProbeRTT(eventTime monotime.Time) {
 	// Restore cwnd.
 	b.congestionWindow = max(b.priorCwnd, b.minCongestionWindow())
 
-	// Transition to ProbeBW CRUISE (clean slate after RTT probe).
-	b.enterProbeBWCruise(eventTime)
+	// Transition to ProbeBW_DOWN to start a clean probe cycle after RTT probe.
+	b.enterProbeBWDown(eventTime)
 }
 
 // ---------- Cwnd Calculation ----------
@@ -856,44 +887,40 @@ func (b *bbrv3Sender) bdp() protocol.ByteCount {
 }
 
 func (b *bbrv3Sender) targetCwnd() protocol.ByteCount {
-  bdp := b.bdp()
-  
-  // FIX: The BDP Bootstrapper.
-  // Force the BDP to be at least the size of our initial starting window.
-  // This physically prevents the "Cwnd Collapse Loop" when BtlBw is artificially low.
-  initialCwnd := protocol.ByteCount(bbrInitialCongestionWindowPackets) * b.maxDatagramSize
-  if bdp < initialCwnd {
-    bdp = initialCwnd
-  }
+	bdp := b.bdp()
 
-  if bdp == 0 {
-    return b.congestionWindow
-  }
+	// Time-bounded BDP bootstrap: during the first bbrBandwidthWindowSize rounds,
+	// floor BDP at the initial cwnd to prevent collapse before we have valid
+	// bandwidth estimates. After the bootstrap period, trust the measured BDP.
+	initialCwnd := protocol.ByteCount(bbrInitialCongestionWindowPackets) * b.maxDatagramSize
+	if b.roundCount < bbrBandwidthWindowSize && bdp < initialCwnd {
+		bdp = initialCwnd
+	}
 
-  var target protocol.ByteCount
-  switch b.mode {
-  case bbrProbeBW:
-    target = protocol.ByteCount(b.cwndGain * float64(bdp))
-    if b.inflightHi > 0 && target > b.inflightHi {
-      target = b.inflightHi
-    }
-    if b.probeBWPhase == probeBWCruise || b.probeBWPhase == probeBWDown {
-      if b.inflightLo > 0 && target > b.inflightLo {
-        target = b.inflightLo
-      }
-    }
-  default:
-    target = protocol.ByteCount(b.cwndGain * float64(bdp))
-  }
+	if bdp == 0 {
+		return b.congestionWindow
+	}
 
-  if b.inflightHi > 0 && target > b.inflightHi {
-    target = b.inflightHi
-  }
+	var target protocol.ByteCount
+	switch b.mode {
+	case bbrProbeBW:
+		target = protocol.ByteCount(b.cwndGain * float64(bdp))
+		if b.inflightHi > 0 && target > b.inflightHi {
+			target = b.inflightHi
+		}
+		if b.probeBWPhase == probeBWCruise || b.probeBWPhase == probeBWDown {
+			if b.inflightLo > 0 && target > b.inflightLo {
+				target = b.inflightLo
+			}
+		}
+	default:
+		target = protocol.ByteCount(b.cwndGain * float64(bdp))
+	}
 
-  if target < b.minCongestionWindow() {
-    target = b.minCongestionWindow()
-  }
-  return target
+	if target < b.minCongestionWindow() {
+		target = b.minCongestionWindow()
+	}
+	return target
 }
 
 func (b *bbrv3Sender) updateCwnd() {
@@ -930,51 +957,10 @@ func (b *bbrv3Sender) minCongestionWindow() protocol.ByteCount {
 
 // ---------- Diagnostic Telemetry ----------
 
-const bbrLogInterval = 500 * time.Millisecond
-
-// logState prints a single-line diagnostic snapshot of the BBR state machine.
-// It is throttled to fire at most once every 500 ms (wall-clock) so that it
-// does not measurably affect throughput or flood the console.
-func (b *bbrv3Sender) logState(bytesInFlight protocol.ByteCount) {
-	now := time.Now()
-	if now.Sub(b.lastLogTime) < bbrLogInterval {
-		return
-	}
-	b.lastLogTime = now
-
-	// Compute human-readable state label.
-	state := b.mode.String()
-	if b.mode == bbrProbeBW {
-		state = "ProbeBW_" + b.probeBWPhase.String()
-	}
-
-	// Delivery rate from last sample in KB/s.
-	sampleKBps := float64(b.lastSampleRate/BytesPerSecond) / 1024.0
-
-	// Windowed max bandwidth in KB/s.
-	btlKBps := float64(b.btlBw/BytesPerSecond) / 1024.0
-
-	// MinRTT in ms.
-	minRttMs := float64(b.minRtt) / float64(time.Millisecond)
-
-	// BDP in bytes.
-	bdp := b.bdp()
-
-	// Pacing rate in KB/s.
-	pacingKBps := float64(b.pacingRateBytesPerSec()) / 1024.0
-
-	// bwLo in KB/s (0 = uncapped).
-	bwLoKBps := float64(b.bwLo/BytesPerSecond) / 1024.0
-
-	fmt.Printf("[BBRv3] state=%-16s | sample=%8.1f KB/s  btlBw=%8.1f KB/s  minRTT=%6.1f ms | "+
-		"BDP=%8d  cwnd=%8d  inflight=%8d  pacing=%8.1f KB/s | "+
-		"inflightHi=%8d  inflightLo=%8d  bwLo=%8.1f KB/s  round=%d  lossRound=%d\n",
-		state,
-		sampleKBps, btlKBps, minRttMs,
-		bdp, b.congestionWindow, bytesInFlight, pacingKBps,
-		b.inflightHi, b.inflightLo, bwLoKBps, b.roundCount, b.lossInRound,
-	)
-}
+// logState is a no-op placeholder. Diagnostic logging has been removed from the
+// hot path to avoid syscall overhead (time.Now + fmt.Printf). Use qlog events
+// for production telemetry instead.
+func (b *bbrv3Sender) logState(_ protocol.ByteCount) {}
 
 // ---------- qlog ----------
 

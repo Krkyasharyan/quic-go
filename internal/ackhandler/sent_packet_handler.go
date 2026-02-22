@@ -310,7 +310,14 @@ func (h *sentPacketHandler) SentPacket(
 	if isAckEliciting && h.bytesInFlight >= h.congestion.GetCongestionWindow() {
 		h.deliveryEstimator.SetAppLimited(false)
 	}
-	ds := h.deliveryEstimator.OnPacketSent(t, h.bytesInFlight-size)
+	// Compute prior bytes-in-flight: the state *before* this packet was added.
+	// For ack-eliciting packets, bytesInFlight was already incremented above,
+	// so subtract size. For non-ack-eliciting packets, it was not incremented.
+	priorBytesInFlight := h.bytesInFlight
+	if isAckEliciting {
+		priorBytesInFlight -= size
+	}
+	ds := h.deliveryEstimator.OnPacketSent(t, priorBytesInFlight)
 	p.deliveredAtSend = ds.Delivered
 	p.deliveredTimeAtSend = ds.DeliveredTime
 	p.firstSentTimeAtSend = ds.FirstSentTime
