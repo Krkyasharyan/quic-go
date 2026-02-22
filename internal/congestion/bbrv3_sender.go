@@ -432,14 +432,19 @@ func (b *bbrv3Sender) currentLossRate() float64 {
 // at the current cwnd and transitions to ProbeBW_DOWN to re-probe gracefully.
 // This preserves btlBw and minRtt estimates.
 func (b *bbrv3Sender) OnRetransmissionTimeout(packetsRetransmitted bool) {
-	if !packetsRetransmitted {
-		return
-	}
-	if b.congestionWindow > 0 {
-		b.inflightHi = b.congestionWindow
-	}
-	b.enterProbeBWDown(b.clock.Now())
-	b.largestSentAtLastCutback = protocol.InvalidPacketNumber
+  if !packetsRetransmitted {
+    return
+  }
+  if b.congestionWindow > 0 {
+    b.inflightHi = b.congestionWindow
+  }
+  
+  // FIX: Only transition to DOWN if we are already in the steady-state. 
+  // Do NOT abort the exponential STARTUP phase due to a normal handshake PTO!
+  if b.mode != bbrStartup {
+    b.enterProbeBWDown(b.clock.Now())
+  }
+  b.largestSentAtLastCutback = protocol.InvalidPacketNumber
 }
 
 // SetMaxDatagramSize updates the MTU.
@@ -851,41 +856,44 @@ func (b *bbrv3Sender) bdp() protocol.ByteCount {
 }
 
 func (b *bbrv3Sender) targetCwnd() protocol.ByteCount {
-	bdp := b.bdp()
-	if bdp == 0 {
-		return b.congestionWindow
-	}
+  bdp := b.bdp()
+  
+  // FIX: The BDP Bootstrapper.
+  // Force the BDP to be at least the size of our initial starting window.
+  // This physically prevents the "Cwnd Collapse Loop" when BtlBw is artificially low.
+  initialCwnd := protocol.ByteCount(bbrInitialCongestionWindowPackets) * b.maxDatagramSize
+  if bdp < initialCwnd {
+    bdp = initialCwnd
+  }
 
-	var target protocol.ByteCount
-	switch b.mode {
-	case bbrProbeBW:
-		// BBRv3 ProbeBW: cwnd = cwndGain × BDP, bounded by inflight caps.
-		target = protocol.ByteCount(b.cwndGain * float64(bdp))
-		// Apply inflight_hi cap (limits overshoot from probing).
-		if b.inflightHi > 0 && target > b.inflightHi {
-			target = b.inflightHi
-		}
-		// Apply inflight_lo cap during CRUISE and DOWN (limits steady-state queue).
-		if b.probeBWPhase == probeBWCruise || b.probeBWPhase == probeBWDown {
-			if b.inflightLo > 0 && target > b.inflightLo {
-				target = b.inflightLo
-			}
-		}
-	default:
-		// Startup/Drain use cwndGain × BDP.
-		target = protocol.ByteCount(b.cwndGain * float64(bdp))
-	}
+  if bdp == 0 {
+    return b.congestionWindow
+  }
 
-	// Global inflight_hi cap (set by Startup loss or ProbeBW_UP).
-	if b.inflightHi > 0 && target > b.inflightHi {
-		target = b.inflightHi
-	}
+  var target protocol.ByteCount
+  switch b.mode {
+  case bbrProbeBW:
+    target = protocol.ByteCount(b.cwndGain * float64(bdp))
+    if b.inflightHi > 0 && target > b.inflightHi {
+      target = b.inflightHi
+    }
+    if b.probeBWPhase == probeBWCruise || b.probeBWPhase == probeBWDown {
+      if b.inflightLo > 0 && target > b.inflightLo {
+        target = b.inflightLo
+      }
+    }
+  default:
+    target = protocol.ByteCount(b.cwndGain * float64(bdp))
+  }
 
-	// Floor: never below minimum cwnd.
-	if target < b.minCongestionWindow() {
-		target = b.minCongestionWindow()
-	}
-	return target
+  if b.inflightHi > 0 && target > b.inflightHi {
+    target = b.inflightHi
+  }
+
+  if target < b.minCongestionWindow() {
+    target = b.minCongestionWindow()
+  }
+  return target
 }
 
 func (b *bbrv3Sender) updateCwnd() {
