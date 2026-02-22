@@ -3,6 +3,7 @@ package congestion
 import (
 	"fmt"
 	"math/rand"
+	// "os"
 	"time"
 
 	"github.com/quic-go/quic-go/internal/monotime"
@@ -11,6 +12,12 @@ import (
 	"github.com/quic-go/quic-go/qlog"
 	"github.com/quic-go/quic-go/qlogwriter"
 )
+
+// bbrDebugLog is checked once at process start. Set QUIC_BBR_DEBUG=1 to enable
+// per-ACK diagnostic logging to stderr. When false, logState is a single branch
+// on a package-level bool — effectively zero overhead.
+// var bbrDebugLog = os.Getenv("QUIC_BBR_DEBUG") == "1"
+var bbrDebugLog = true
 
 // ---------- BBR Mode (Top-Level State Machine) ----------
 
@@ -199,6 +206,9 @@ type bbrv3Sender struct {
 
 	// --- qlog ---
 	lastState qlog.CongestionState
+
+	// --- Debug logging (only active when QUIC_BBR_DEBUG=1) ---
+	lastLogTime time.Time
 }
 
 var (
@@ -957,10 +967,54 @@ func (b *bbrv3Sender) minCongestionWindow() protocol.ByteCount {
 
 // ---------- Diagnostic Telemetry ----------
 
-// logState is a no-op placeholder. Diagnostic logging has been removed from the
-// hot path to avoid syscall overhead (time.Now + fmt.Printf). Use qlog events
-// for production telemetry instead.
-func (b *bbrv3Sender) logState(_ protocol.ByteCount) {}
+// logState prints a one-line BBRv3 state snapshot to stderr, throttled to ≤2 Hz.
+// It is gated behind the package-level bbrDebugLog flag (set via QUIC_BBR_DEBUG=1
+// environment variable). When the flag is false the function returns immediately
+// after a single bool check — no allocations, no syscalls.
+func (b *bbrv3Sender) logState(bytesInFlight protocol.ByteCount) {
+	if !bbrDebugLog {
+		return
+	}
+
+	now := time.Now()
+	if !b.lastLogTime.IsZero() && now.Sub(b.lastLogTime) < 500*time.Millisecond {
+		return
+	}
+	b.lastLogTime = now
+
+	var state string
+	switch b.mode {
+	case bbrStartup:
+		state = "Startup"
+	case bbrDrain:
+		state = "Drain"
+	case bbrProbeBW:
+		state = "ProbeBW_" + b.probeBWPhase.String()
+	case bbrProbeRTT:
+		state = "ProbeRTT"
+	default:
+		state = "Unknown"
+	}
+
+	sampleKBps := float64(b.btlBw/BytesPerSecond) / 1024.0
+	btlKBps := float64(b.btlBw/BytesPerSecond) / 1024.0
+	minRttMs := float64(b.minRtt) / float64(time.Millisecond)
+	bdp := b.bdp()
+	pacingKBps := float64(b.pacingRateBytesPerSec()) / 1024.0
+	var bwLoKBps float64
+	if b.bwLo > 0 {
+		bwLoKBps = float64(b.bwLo/BytesPerSecond) / 1024.0
+	}
+
+	fmt.Printf("[BBRv3] state=%-16s | sample=%8.1f KB/s  btlBw=%8.1f KB/s  minRTT=%6.1f ms | "+
+		"BDP=%8d  cwnd=%8d  inflight=%8d  pacing=%8.1f KB/s | "+
+		"inflightHi=%8d  inflightLo=%8d  bwLo=%8.1f KB/s  round=%d  lossRound=%d\n",
+		state,
+		sampleKBps, btlKBps, minRttMs,
+		bdp, b.congestionWindow, bytesInFlight, pacingKBps,
+		b.inflightHi, b.inflightLo, bwLoKBps, b.roundCount, b.lossInRound,
+	)
+}
 
 // ---------- qlog ----------
 
