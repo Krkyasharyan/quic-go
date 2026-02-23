@@ -90,6 +90,7 @@ type sentPacketHandler struct {
 	bytesInFlight protocol.ByteCount
 
 	congestion        congestion.SendAlgorithmWithDebugInfos
+	congestionAlgo    protocol.CongestionControlAlgorithm
 	deliveryEstimator *congestion.DeliveryRateEstimator
 	rttStats          *utils.RTTStats
 	connStats         *utils.ConnectionStats
@@ -125,12 +126,14 @@ func NewSentPacketHandler(
 	connStats *utils.ConnectionStats,
 	clientAddressValidated bool,
 	enableECN bool,
+	congestionAlgo protocol.CongestionControlAlgorithm,
 	ignorePacketsBelow func(protocol.PacketNumber),
 	pers protocol.Perspective,
 	qlogger qlogwriter.Recorder,
 	logger utils.Logger,
 ) SentPacketHandler {
-	cc := congestion.NewBBRv3Sender(
+	cc := congestion.NewCongestionControl(
+		congestionAlgo,
 		congestion.DefaultClock{},
 		rttStats,
 		connStats,
@@ -148,6 +151,7 @@ func NewSentPacketHandler(
 		rttStats:                       rttStats,
 		connStats:                      connStats,
 		congestion:                     cc,
+		congestionAlgo:                 congestionAlgo,
 		deliveryEstimator:              congestion.NewDeliveryRateEstimator(),
 		ignorePacketsBelow:             ignorePacketsBelow,
 		perspective:                    pers,
@@ -1199,7 +1203,8 @@ func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSi
 	for pn := range h.appDataPackets.history.PathProbes() {
 		h.appDataPackets.history.RemovePathProbe(pn)
 	}
-	h.congestion = congestion.NewBBRv3Sender(
+	h.congestion = congestion.NewCongestionControl(
+		h.congestionAlgo,
 		congestion.DefaultClock{},
 		h.rttStats,
 		h.connStats,

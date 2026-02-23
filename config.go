@@ -51,6 +51,12 @@ func validateConfig(config *Config) error {
 			return fmt.Errorf("invalid QUIC version: %s", v)
 		}
 	}
+	switch config.CongestionControl {
+	case protocol.CongestionControlBBRv3, protocol.CongestionControlCubic:
+		// valid
+	default:
+		return fmt.Errorf("unknown congestion control algorithm: %d", config.CongestionControl)
+	}
 	return nil
 }
 
@@ -125,5 +131,6 @@ func populateConfig(config *Config) *Config {
 		EnableStreamResetPartialDelivery: config.EnableStreamResetPartialDelivery,
 		Allow0RTT:                        config.Allow0RTT,
 		Tracer:                           config.Tracer,
+		CongestionControl:                config.CongestionControl,
 	}
 }

@@ -16,6 +16,16 @@ import (
 // The StreamID is the ID of a QUIC stream.
 type StreamID = protocol.StreamID
 
+// CongestionControlAlgorithm identifies the congestion control algorithm.
+type CongestionControlAlgorithm = protocol.CongestionControlAlgorithm
+
+const (
+	// CongestionControlBBRv3 selects the BBRv3 congestion control algorithm (default).
+	CongestionControlBBRv3 = protocol.CongestionControlBBRv3
+	// CongestionControlCubic selects the Cubic congestion control algorithm.
+	CongestionControlCubic = protocol.CongestionControlCubic
+)
+
 // A Version is a QUIC version number.
 type Version = protocol.Version
 
@@ -177,6 +187,9 @@ type Config struct {
 	EnableStreamResetPartialDelivery bool
 
 	Tracer func(ctx context.Context, isClient bool, connID ConnectionID) qlogwriter.Trace
+	// CongestionControl selects the congestion control algorithm.
+	// Supported values: CongestionControlBBRv3 (default), CongestionControlCubic.
+	CongestionControl CongestionControlAlgorithm
 }
 
 // ClientInfo contains information about an incoming connection attempt.

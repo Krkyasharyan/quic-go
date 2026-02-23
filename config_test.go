@@ -128,6 +128,8 @@ func configWithNonZeroNonFunctionFields(t *testing.T) *Config {
 			f.Set(reflect.ValueOf(true))
 		case "EnableStreamResetPartialDelivery":
 			f.Set(reflect.ValueOf(true))
+		case "CongestionControl":
+			f.Set(reflect.ValueOf(CongestionControlCubic))
 		default:
 			t.Fatalf("all fields must be accounted for, but saw unknown field %q", fn)
 		}
@@ -196,4 +198,32 @@ func TestConfigZeroLimits(t *testing.T) {
 	c := populateConfig(config)
 	require.Zero(t, c.MaxIncomingStreams)
 	require.Zero(t, c.MaxIncomingUniStreams)
+}
+
+func TestConfigCongestionControl(t *testing.T) {
+	t.Run("default is BBRv3", func(t *testing.T) {
+		c := populateConfig(&Config{})
+		require.Equal(t, CongestionControlBBRv3, c.CongestionControl)
+	})
+
+	t.Run("Cubic is valid", func(t *testing.T) {
+		c := &Config{CongestionControl: CongestionControlCubic}
+		require.NoError(t, validateConfig(c))
+		require.Equal(t, CongestionControlCubic, c.CongestionControl)
+	})
+
+	t.Run("BBRv3 is valid", func(t *testing.T) {
+		c := &Config{CongestionControl: CongestionControlBBRv3}
+		require.NoError(t, validateConfig(c))
+	})
+
+	t.Run("unknown algorithm is rejected", func(t *testing.T) {
+		c := &Config{CongestionControl: 42}
+		require.Error(t, validateConfig(c))
+	})
+
+	t.Run("propagated through populateConfig", func(t *testing.T) {
+		c := populateConfig(&Config{CongestionControl: CongestionControlCubic})
+		require.Equal(t, CongestionControlCubic, c.CongestionControl)
+	})
 }
