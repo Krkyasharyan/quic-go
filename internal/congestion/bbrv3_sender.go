@@ -675,13 +675,12 @@ func (b *bbrv3Sender) OnBandwidthSample(sample RateSample) {
 }
 
 // updateMaxBw implements spec §5.5.5 BBRUpdateMaxBw.
+// NOTE: the spec does NOT guard this with idle_restart. Post-idle samples
+// are protected by the IsAppLimited tag (which prevents low-quality idle
+// samples from being admitted) and by the cycle advancement guard in
+// adaptLongTermModel (which prevents cycleCount from advancing on
+// app-limited samples). Together these preserve the filter during idle.
 func (b *bbrv3Sender) updateMaxBw(sample RateSample) {
-	// Skip maxBw updates during idle restart: the pipe hasn't refilled yet,
-	// so delivery rate samples don't reflect true network capacity.
-	// The idle_restart flag is cleared after the first delivered ACK.
-	if b.idleRestart {
-		return
-	}
 	if sample.DeliveryRate > 0 &&
 		(sample.DeliveryRate >= b.maxBw || !sample.IsAppLimited) {
 		b.maxBwFilter.Update(int64(sample.DeliveryRate), b.cycleCount)
@@ -1048,6 +1047,17 @@ func (b *bbrv3Sender) checkDrain(bytesInFlight protocol.ByteCount) {
 
 func (b *bbrv3Sender) enterProbeBW() {
 	// Spec §5.3.3.6 BBREnterProbeBW.
+
+	// If inflightLongterm was never set (no loss in Startup), initialize it
+	// based on the observed BDP. Without this, cwnd stays at Startup levels
+	// indefinitely because boundCwndForModel treats inflightLongterm=0 as
+	// "no bound". The kernel BBR implementation also initializes inflight_hi
+	// at ProbeBW entry. ProbeBW_UP will grow it via additive increase if
+	// the network can handle more.
+	if b.inflightLongterm == 0 {
+		b.inflightLongterm = b.inflightForGain(bbrDefaultCwndGain)
+	}
+
 	b.cwndGain = bbrDefaultCwndGain // 2.0
 	b.startProbeBWDown()
 }

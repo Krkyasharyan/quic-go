@@ -331,7 +331,10 @@ func (h *sentPacketHandler) SentPacket(
 	p.isAppLimitedAtSend = ds.IsAppLimited
 	p.bytesInFlightAtSend = priorBytesInFlight
 
-	h.congestion.OnPacketSent(t, h.bytesInFlight, pn, size, isAckEliciting)
+	// Pass priorBytesInFlight (before this packet was added) so the congestion
+	// controller can detect idle→active transitions (bytesInFlight was 0).
+	// This is critical for BBRv3's handleRestartFromIdle (spec §5.4.1).
+	h.congestion.OnPacketSent(t, priorBytesInFlight, pn, size, isAckEliciting)
 
 	if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil {
 		h.ecnTracker.SentPacket(pn, ecn)
