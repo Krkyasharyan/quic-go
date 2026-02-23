@@ -326,6 +326,7 @@ func (h *sentPacketHandler) SentPacket(
 	p.deliveredTimeAtSend = ds.DeliveredTime
 	p.firstSentTimeAtSend = ds.FirstSentTime
 	p.isAppLimitedAtSend = ds.IsAppLimited
+	p.bytesInFlightAtSend = priorBytesInFlight
 
 	h.congestion.OnPacketSent(t, h.bytesInFlight, pn, size, isAckEliciting)
 
@@ -473,9 +474,11 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 	}
 	var acked1RTTPacket bool
 	var bestSample congestion.RateSample
+	var totalNewlyAcked protocol.ByteCount
 	for _, p := range ackedPackets {
 		if p.includedInBytesInFlight {
 			h.congestion.OnPacketAcked(p.PacketNumber, p.Length, priorInFlight, rcvTime)
+			totalNewlyAcked += p.Length
 
 			// Compute a delivery-rate sample for this packet.
 			pktState := congestion.PacketDeliveryState{
@@ -485,6 +488,8 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 				IsAppLimited:  p.isAppLimitedAtSend,
 			}
 			sample := h.deliveryEstimator.GenerateRateSample(pktState, p.SendTime, p.Length, rcvTime)
+			sample.TxInFlight = p.bytesInFlightAtSend
+			sample.PacketSize = p.Length
 			// Prefer non-app-limited samples over app-limited ones.
 			// Among samples of the same limitation status, prefer higher delivery rate.
 			// This prevents app-limited samples from crowding out real bottleneck measurements.
@@ -506,6 +511,7 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 	}
 	// Feed the best delivery-rate sample from this ACK to the congestion controller.
 	if bestSample.DeliveryRate > 0 {
+		bestSample.NewlyAcked = totalNewlyAcked
 		if bsc, ok := h.congestion.(congestion.BandwidthSampleConsumer); ok {
 			bsc.OnBandwidthSample(bestSample)
 		}

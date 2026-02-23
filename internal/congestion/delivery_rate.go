@@ -27,6 +27,13 @@ type RateSample struct {
 	PriorTime      monotime.Time      // deliveredTime when the sampled packet was sent
 	SendElapsed    time.Duration      // sentTime - firstSentTimeAtSend
 	AckElapsed     time.Duration      // now - deliveredTimeAtSend
+
+	// Fields required by BBRv3 per-ACK and per-loss processing (spec §2.2).
+	NewlyAcked protocol.ByteCount // RS.newly_acked: bytes acked in this ACK event
+	NewlyLost  protocol.ByteCount // RS.newly_lost: bytes lost detected in this ACK event
+	TxInFlight protocol.ByteCount // RS.tx_in_flight: C.inflight when acked packet was sent
+	PacketLost protocol.ByteCount // RS.lost: bytes lost between transmit and ack of this packet
+	PacketSize protocol.ByteCount // size of the individual packet (for per-loss processing)
 }
 
 // BandwidthSampleConsumer is implemented by congestion controllers that

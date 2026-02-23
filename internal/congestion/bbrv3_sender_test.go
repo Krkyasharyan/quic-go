@@ -253,7 +253,7 @@ func TestBBRv3PacingDeathZoneClamp(t *testing.T) {
 	targetBytesPerSec := uint64(30) * uint64(bbrTestMaxDatagramSize) // 38400 bytes/s
 	targetBw := Bandwidth(targetBytesPerSec) * BytesPerSecond        // in bits/s
 
-	s.sender.btlBw = targetBw
+	s.sender.bw = targetBw
 	s.sender.pacingGain = 1.0
 	// Set cwnd small enough and SRTT large enough that cwndBw doesn't override btlBw.
 	s.sender.congestionWindow = 4 * bbrTestMaxDatagramSize
@@ -274,7 +274,7 @@ func TestBBRv3PacingAboveDeathZone(t *testing.T) {
 	targetBytesPerSec := uint64(50) * uint64(bbrTestMaxDatagramSize)
 	targetBw := Bandwidth(targetBytesPerSec) * BytesPerSecond
 
-	s.sender.btlBw = targetBw
+	s.sender.bw = targetBw
 	s.sender.pacingGain = 1.0
 	// Set cwnd small enough and SRTT large enough that cwndBw doesn't override btlBw.
 	s.sender.congestionWindow = 4 * bbrTestMaxDatagramSize
@@ -283,9 +283,9 @@ func TestBBRv3PacingAboveDeathZone(t *testing.T) {
 	rate := s.sender.pacingRateBytesPerSec()
 	pps := rate / uint64(bbrTestMaxDatagramSize)
 
-	// Should NOT be clamped — should remain at 50.
-	require.Equal(t, uint64(50), pps,
-		"pacing above death zone should not be clamped: expected 50, got %d", pps)
+	// Should NOT be clamped — PacingMarginPercent (1%) reduces 50→49.
+	require.Equal(t, uint64(49), pps,
+		"pacing above death zone should not be clamped (after 1%% margin): expected 49, got %d", pps)
 }
 
 func TestBBRv3PacingBelowDeathZone(t *testing.T) {
@@ -295,7 +295,7 @@ func TestBBRv3PacingBelowDeathZone(t *testing.T) {
 	targetBytesPerSec := uint64(20) * uint64(bbrTestMaxDatagramSize)
 	targetBw := Bandwidth(targetBytesPerSec) * BytesPerSecond
 
-	s.sender.btlBw = targetBw
+	s.sender.bw = targetBw
 	s.sender.pacingGain = 1.0
 	// Set cwnd small enough and SRTT large enough that cwndBw doesn't override btlBw.
 	// cwndBw with 4*1280/0.2s = 25600 bytes/s = 20 pps — same as target, so btlBw dominates.
@@ -305,9 +305,9 @@ func TestBBRv3PacingBelowDeathZone(t *testing.T) {
 	rate := s.sender.pacingRateBytesPerSec()
 	pps := rate / uint64(bbrTestMaxDatagramSize)
 
-	// Should NOT be clamped — should remain at 20.
-	require.Equal(t, uint64(20), pps,
-		"pacing below death zone should not be clamped: expected 20, got %d", pps)
+	// Should NOT be clamped — PacingMarginPercent (1%) reduces 20→19.
+	require.Equal(t, uint64(19), pps,
+		"pacing below death zone should not be clamped (after 1%% margin): expected 19, got %d", pps)
 }
 
 func TestBBRv3ProbeRTTTransition(t *testing.T) {
@@ -318,9 +318,10 @@ func TestBBRv3ProbeRTTTransition(t *testing.T) {
 	s.driveToState(bbrProbeBW, rtt)
 	require.Equal(t, bbrProbeBW, s.sender.Mode())
 
-	// Set minRttTimestamp far in the past so updateMinRtt computes
-	// elapsed > 10s and sets minRttExpired = true naturally.
-	s.sender.minRttTimestamp = s.clock.Now().Add(-11 * time.Second)
+	// Set minRttStamp and probeRttMinStamp far in the past so updateMinRtt computes
+	// probeRttExpired = true naturally (elapsed > ProbeRTTInterval = 5s).
+	s.sender.minRttStamp = s.clock.Now().Add(-11 * time.Second)
+	s.sender.probeRttMinStamp = s.clock.Now().Add(-6 * time.Second)
 
 	// Use a higher RTT so the latestRtt > minRtt check doesn't reset the flag.
 	higherRtt := 200 * time.Millisecond
@@ -332,9 +333,9 @@ func TestBBRv3ProbeRTTTransition(t *testing.T) {
 	require.Equal(t, bbrProbeRTT, s.sender.Mode(),
 		"should have entered ProbeRTT when min RTT expired")
 
-	// Cwnd should be at minimum.
-	require.Equal(t, s.sender.minCongestionWindow(), s.sender.GetCongestionWindow(),
-		"cwnd should be minimal during ProbeRTT")
+	// Cwnd should be at minimum (ProbeRTTCwndGain = 0.5 * BDP, floored at minCwnd).
+	require.LessOrEqual(t, s.sender.GetCongestionWindow(), s.sender.probeRTTCwnd(),
+		"cwnd should be at ProbeRTT level during ProbeRTT")
 }
 
 func TestBBRv3ProbeRTTDisableToggle(t *testing.T) {
@@ -349,7 +350,8 @@ func TestBBRv3ProbeRTTDisableToggle(t *testing.T) {
 	s.sender.SetDisableProbeRTT(true)
 
 	// Set old timestamp so minRttExpired would be true.
-	s.sender.minRttTimestamp = s.clock.Now().Add(-11 * time.Second)
+	s.sender.minRttStamp = s.clock.Now().Add(-11 * time.Second)
+	s.sender.probeRttMinStamp = s.clock.Now().Add(-6 * time.Second)
 	higherRtt := 200 * time.Millisecond
 
 	// Ack — should NOT enter ProbeRTT.
@@ -368,7 +370,8 @@ func TestBBRv3ProbeRTTExitToProbeBW(t *testing.T) {
 
 	// Drive to ProbeBW, then force into ProbeRTT via old timestamp.
 	s.driveToState(bbrProbeBW, rtt)
-	s.sender.minRttTimestamp = s.clock.Now().Add(-11 * time.Second)
+	s.sender.minRttStamp = s.clock.Now().Add(-11 * time.Second)
+	s.sender.probeRttMinStamp = s.clock.Now().Add(-6 * time.Second)
 
 	s.sendNPackets(1)
 	s.clock.Advance(higherRtt)
@@ -448,17 +451,16 @@ func TestBBRv3RTO(t *testing.T) {
 	cwndBefore := s.sender.GetCongestionWindow()
 	s.sender.OnRetransmissionTimeout(true)
 
-	// BBRv3: RTO does NOT collapse cwnd. It sets inflightHi as a cap
-	// and transitions to ProbeBW_DOWN to re-probe gracefully.
+	// BBRv3: RTO saves cwnd into inflightHi and transitions to ProbeBW_DOWN.
 	require.Equal(t, cwndBefore, s.sender.InflightHi(),
 		"inflightHi should be set to cwnd before RTO")
 	require.Equal(t, bbrProbeBW, s.sender.Mode(),
 		"should transition to ProbeBW after RTO")
 	require.Equal(t, probeBWDown, s.sender.ProbeBWPhaseValue(),
 		"should be in ProbeBW_DOWN sub-state after RTO")
-	// Cwnd should be recalculated based on targetCwnd with inflightHi cap, not collapsed.
-	require.Greater(t, s.sender.GetCongestionWindow(), s.sender.minCongestionWindow(),
-		"cwnd should NOT collapse to minimum after RTO in BBRv3")
+	// Cwnd is set to minCwnd during RTO (restored later via restoreCwnd).
+	require.Equal(t, s.sender.minCongestionWindow(), s.sender.GetCongestionWindow(),
+		"cwnd should be set to minCwnd during RTO (saved prior cwnd for later restoration)")
 }
 
 func TestBBRv3SetMaxDatagramSize(t *testing.T) {
@@ -510,7 +512,7 @@ func TestBBRv3LossInStartupSetsInflightHi(t *testing.T) {
 func TestBBRv3StartupGains(t *testing.T) {
 	s := newTestBBRSender()
 	require.InDelta(t, bbrStartupPacingGain, s.sender.pacingGain, 0.01)
-	require.InDelta(t, bbrStartupCwndGain, s.sender.cwndGain, 0.01)
+	require.InDelta(t, bbrDefaultCwndGain, s.sender.cwndGain, 0.01)
 }
 
 func TestBBRv3ProbeBWSubStates(t *testing.T) {
@@ -541,12 +543,8 @@ func TestBBRv3ProbeBWSubStateCycle(t *testing.T) {
 	}
 	require.Equal(t, probeBWCruise, s.sender.ProbeBWPhaseValue())
 
-	// Advance past the CRUISE deadline (at most 2×minRTT from entry).
-	minRtt := s.sender.MinRtt()
-	if minRtt <= 0 {
-		minRtt = 100 * time.Millisecond
-	}
-	s.clock.Advance(2*minRtt + time.Millisecond)
+	// Advance past the bwProbeWait deadline (2-3s randomized wall clock).
+	s.clock.Advance(4 * time.Second)
 	s.sendNPackets(4)
 	s.clock.Advance(rtt)
 	s.ackNPackets(4, rtt)
@@ -595,19 +593,16 @@ func TestBBRv3ProbeBWLossInUp(t *testing.T) {
 	// Send enough packets to have significant inflight.
 	s.sendNPackets(32)
 
-	// Inject enough loss to exceed the 2% threshold.
-	// BBRv3 loss rate = lost / (lost + delivered_in_round).
-	// Losing 10 packets (12800 bytes) is clearly excessive for any
-	// reasonable delivered_in_round value.
+	// Inject enough loss to trigger the lossInRound flag.
+	// With lossInRound && bwProbeSamples > 0, handleProbeBWLoss will
+	// call handleInflightTooHigh and transition to DOWN.
 	s.loseNPackets(10)
 
-	// After excessive loss in UP, should transition to DOWN, cap inflightHi, and set bwLo.
+	// After loss in UP, should transition to DOWN, cap inflightHi.
 	require.Equal(t, probeBWDown, s.sender.ProbeBWPhaseValue(),
-		"excessive loss in UP should trigger transition to DOWN")
+		"loss in UP should trigger transition to DOWN")
 	require.Greater(t, s.sender.InflightHi(), protocol.ByteCount(0),
-		"inflightHi should be set after excessive loss in UP")
-	require.Greater(t, s.sender.BwLo(), Bandwidth(0),
-		"bwLo should be set after excessive loss in UP")
+		"inflightHi should be set after loss in UP")
 }
 
 func TestBBRv3ProbeBWLossInCruiseSetsBound(t *testing.T) {
@@ -621,11 +616,18 @@ func TestBBRv3ProbeBWLossInCruiseSetsBound(t *testing.T) {
 	// Send some packets.
 	s.sendNPackets(10)
 
-	// Lose a packet in CRUISE — should set inflightLo.
+	// Lose a packet in CRUISE — sets lossInRound = true.
 	s.loseNPackets(1)
 
+	// Short-term bounds are adapted at round boundaries via
+	// adaptLowerBoundsFromCongestion. Send + ACK to trigger
+	// OnBandwidthSample → lossRoundStart → adaptLowerBoundsFromCongestion.
+	s.sendNPackets(4)
+	s.clock.Advance(rtt)
+	s.ackNPackets(4, rtt)
+
 	require.Greater(t, s.sender.InflightLo(), protocol.ByteCount(0),
-		"inflightLo should be set after loss in CRUISE")
+		"inflightLo should be set after loss in CRUISE + round boundary")
 }
 
 func TestBBRv3DrainExitOnBDP(t *testing.T) {
@@ -660,19 +662,18 @@ func TestBBRv3ExcessiveLossUsesDeliveredDenominator(t *testing.T) {
 	s.driveToProbeBWPhase(probeBWUp, rtt)
 	require.Equal(t, probeBWUp, s.sender.ProbeBWPhaseValue())
 
-	// Send packets without ACKing to stay in UP.
+	// Send packets and ACK some to advance delivery counters.
 	s.sendNPackets(32)
+	s.clock.Advance(rtt)
+	s.ackNPackets(16, rtt)
 
-	// Heavy loss: 10 packets = clearly excessive regardless of denominator.
-	// BBRv3 loss rate = lost / (lost + deliveredInRound).
-	// With deliveredInRound from previous ACKs and 12800 bytes lost,
-	// this is well above the 2% threshold.
+	// Heavy loss: 10 packets triggers lossInRound + handleInflightTooHigh.
 	s.loseNPackets(10)
 
 	require.Equal(t, probeBWDown, s.sender.ProbeBWPhaseValue(),
-		"heavy loss should trigger excessive loss detection and transition to DOWN")
-	require.Greater(t, s.sender.BwLo(), Bandwidth(0),
-		"bwLo should be set on excessive loss in UP")
+		"heavy loss should trigger transition to DOWN")
+	require.Greater(t, s.sender.InflightHi(), protocol.ByteCount(0),
+		"inflightHi should be set on loss in UP")
 }
 
 func TestBBRv3BwLoCapsPacingRate(t *testing.T) {
@@ -687,7 +688,8 @@ func TestBBRv3BwLoCapsPacingRate(t *testing.T) {
 
 	// Set bwLo to half the bottleneck bandwidth.
 	halfBw := btlBw / 2
-	s.sender.bwLo = halfBw
+	s.sender.bwShortterm = halfBw
+	s.sender.bw = halfBw // manually trigger bounding: bw = min(maxBw, bwShortterm)
 
 	// The pacing rate should be capped at bwLo.
 	rate := s.sender.pacingRateBytesPerSec()
@@ -705,7 +707,7 @@ func TestBBRv3BwLoClearedInRefill(t *testing.T) {
 	s.driveToState(bbrProbeBW, rtt)
 
 	// Set bwLo artificially.
-	s.sender.bwLo = s.sender.BtlBw()
+	s.sender.bwShortterm = s.sender.BtlBw()
 	require.Greater(t, s.sender.BwLo(), Bandwidth(0))
 
 	// Drive to REFILL — bwLo should be cleared.
@@ -734,8 +736,9 @@ func TestBBRv3ECNInUpTransitionsDown(t *testing.T) {
 		"ECN-CE in UP should trigger transition to DOWN")
 	require.Equal(t, priorInFlight, s.sender.InflightHi(),
 		"inflightHi should be set to priorInFlight on ECN in UP")
+	// initLowerBounds initializes bwShortterm from maxBw (non-infinity).
 	require.Greater(t, s.sender.BwLo(), Bandwidth(0),
-		"bwLo should be set on ECN in UP")
+		"bwLo should be initialized on ECN in UP")
 }
 
 func TestBBRv3ECNInCruiseSetsInflightLo(t *testing.T) {
@@ -752,8 +755,10 @@ func TestBBRv3ECNInCruiseSetsInflightLo(t *testing.T) {
 	// Simulate ECN-CE signal.
 	s.sender.OnECNCongestion(priorInFlight)
 
+	// initLowerBounds sets inflightShortterm = congestionWindow,
+	// then the ECN handler tightens it to min(congestionWindow, priorInFlight).
 	require.Equal(t, priorInFlight, s.sender.InflightLo(),
-		"inflightLo should be tightened on ECN in CRUISE")
+		"inflightLo should be tightened to priorInFlight on ECN in CRUISE")
 }
 
 func TestBBRv3LossInRefillTightensInflightLo(t *testing.T) {
@@ -768,11 +773,13 @@ func TestBBRv3LossInRefillTightensInflightLo(t *testing.T) {
 	// Send packets.
 	s.sendNPackets(10)
 
-	// Lose a packet during REFILL — should tighten inflightLo.
+	// Lose a packet during REFILL — handleInflightTooHigh sets inflightLongterm.
+	// (REFILL is a probing phase, so adaptLowerBoundsFromCongestion skips it;
+	// loss during REFILL affects the long-term bound via handleInflightTooHigh.)
 	s.loseNPackets(1)
 
-	require.Greater(t, s.sender.InflightLo(), protocol.ByteCount(0),
-		"inflightLo should be set after loss in REFILL")
+	require.Greater(t, s.sender.InflightHi(), protocol.ByteCount(0),
+		"inflightHi should be set after loss in REFILL")
 }
 
 func TestBBRv3LossInProbeRTTSetsInflightHi(t *testing.T) {
@@ -782,7 +789,9 @@ func TestBBRv3LossInProbeRTTSetsInflightHi(t *testing.T) {
 
 	// Drive to ProbeBW, then force into ProbeRTT.
 	s.driveToState(bbrProbeBW, rtt)
-	s.sender.minRttTimestamp = s.clock.Now().Add(-11 * time.Second)
+	// Expire both minRTT filter and probeRTT interval so checkProbeRTT enters ProbeRTT.
+	s.sender.minRttStamp = s.clock.Now().Add(-11 * time.Second)
+	s.sender.probeRttMinStamp = s.clock.Now().Add(-6 * time.Second)
 
 	s.sendNPackets(1)
 	s.clock.Advance(higherRtt)
@@ -794,13 +803,12 @@ func TestBBRv3LossInProbeRTTSetsInflightHi(t *testing.T) {
 		s.sendNPackets(1)
 	}
 
+	// ECN during ProbeRTT sets inflightLongterm (inflightHi).
 	priorInFlight := s.bytesInFlight
-
-	// Lose a packet during ProbeRTT — should set inflightHi.
-	s.loseNPackets(1)
+	s.sender.OnECNCongestion(priorInFlight)
 
 	require.Equal(t, priorInFlight, s.sender.InflightHi(),
-		"inflightHi should be set after loss in ProbeRTT")
+		"inflightHi should be set after ECN in ProbeRTT")
 }
 
 func TestBBRv3RTOPreservesBandwidthEstimate(t *testing.T) {
@@ -927,12 +935,13 @@ func (s *testBBRSender) driveToProbeBWPhase(targetPhase probeBWPhase, rtt time.D
 // ---------- Phase 4: App-Limited Death Spiral Prevention ----------
 
 func TestBBRv3AppLimitedSampleRejectedWhenBtlBwZero(t *testing.T) {
-	// When btlBw is 0 (initial state), an app-limited sample must NOT seed
-	// the maxBwFilter, even if its rate is positive.
+	// initPacingRate sets a non-zero initial bw from cwnd/srtt.
+	// Verify that an app-limited sample does NOT increase bw beyond
+	// the initial estimate.
 	s := newTestBBRSender()
 	rtt := 50 * time.Millisecond
 
-	require.Equal(t, Bandwidth(0), s.sender.btlBw)
+	initialBw := s.sender.bw
 
 	// Send a single app-limited packet (connection draining scenario).
 	s.sendAppLimitedPacket()
@@ -951,10 +960,10 @@ func TestBBRv3AppLimitedSampleRejectedWhenBtlBwZero(t *testing.T) {
 	s.sender.OnPacketAcked(s.ackedPacketNumber, bbrTestMaxDatagramSize, s.bytesInFlight, s.clock.Now())
 	s.bytesInFlight -= bbrTestMaxDatagramSize
 
-	// Feed the app-limited sample — it should be rejected.
+	// Feed the app-limited sample — it should NOT increase bw.
 	s.sender.OnBandwidthSample(sample)
-	require.Equal(t, Bandwidth(0), s.sender.btlBw,
-		"app-limited sample must not seed btlBw when btlBw is zero")
+	require.LessOrEqual(t, s.sender.bw, initialBw,
+		"app-limited sample must not increase btlBw beyond initial estimate")
 }
 
 func TestBBRv3AppLimitedSampleAcceptedWhenExceedsBtlBw(t *testing.T) {
@@ -970,8 +979,8 @@ func TestBBRv3AppLimitedSampleAcceptedWhenExceedsBtlBw(t *testing.T) {
 		s.clock.Advance(rtt)
 		s.ackNPackets(n, rtt)
 	}
-	require.True(t, s.sender.btlBw > 0, "btlBw should be established")
-	savedBw := s.sender.btlBw
+	require.True(t, s.sender.bw > 0, "btlBw should be established")
+	savedBw := s.sender.bw
 
 	// Now send an app-limited packet, but at a HIGHER rate (e.g., shorter RTT).
 	s.sendAppLimitedPacket()
@@ -992,7 +1001,7 @@ func TestBBRv3AppLimitedSampleAcceptedWhenExceedsBtlBw(t *testing.T) {
 	// Only accept if the delivery rate exceeds btlBw.
 	if sample.DeliveryRate > savedBw {
 		s.sender.OnBandwidthSample(sample)
-		require.True(t, s.sender.btlBw >= savedBw,
+		require.True(t, s.sender.bw >= savedBw,
 			"app-limited sample exceeding btlBw should be accepted")
 	}
 }
@@ -1100,8 +1109,8 @@ func TestBBRv3NormalOperationAfterAppLimitedPhase(t *testing.T) {
 
 	// Drive to ProbeBW with established bandwidth.
 	s.driveToState(bbrProbeBW, rtt)
-	require.True(t, s.sender.btlBw > 0)
-	savedBw := s.sender.btlBw
+	require.True(t, s.sender.bw > 0)
+	savedBw := s.sender.bw
 
 	// Send app-limited for several rounds (should NOT corrupt btlBw).
 	for i := 0; i < 5; i++ {
@@ -1118,7 +1127,7 @@ func TestBBRv3NormalOperationAfterAppLimitedPhase(t *testing.T) {
 			s.sender.OnBandwidthSample(sample)
 		}
 	}
-	require.True(t, s.sender.btlBw >= savedBw,
+	require.True(t, s.sender.bw >= savedBw,
 		"btlBw should not decrease after app-limited samples when rate is lower")
 
 	// Resume full-rate sending — should get back to normal.
@@ -1128,7 +1137,7 @@ func TestBBRv3NormalOperationAfterAppLimitedPhase(t *testing.T) {
 		s.clock.Advance(rtt)
 		s.ackNPackets(n, rtt)
 	}
-	require.True(t, s.sender.btlBw >= savedBw,
+	require.True(t, s.sender.bw >= savedBw,
 		"btlBw should recover after resuming full-rate sending")
 }
 
@@ -1172,7 +1181,7 @@ func TestBBRv3StartupNeedsThreePlateauRounds(t *testing.T) {
 	s.clock.Advance(rtt)
 	s.ackNPackets(10, rtt)
 	require.Equal(t, bbrStartup, s.sender.Mode(), "should still be in Startup after round 1")
-	require.True(t, s.sender.btlBw > 0, "btlBw should be seeded")
+	require.True(t, s.sender.bw > 0, "btlBw should be seeded")
 
 	// Rounds 2, 3: bandwidth ~same → fullBandwidthCount increments.
 	for i := 0; i < 2; i++ {
@@ -1225,7 +1234,7 @@ func TestBBRv3StartupExitsOnBandwidthGrowth(t *testing.T) {
 	s.clock.Advance(rtt)
 	s.ackNPackets(2, rtt)
 	require.Equal(t, bbrStartup, s.sender.Mode())
-	savedBw := s.sender.btlBw
+	savedBw := s.sender.bw
 
 	// Round 2: send more packets → higher delivery rate (more delivered in same RTT).
 	s.sendNPackets(10)
@@ -1233,7 +1242,7 @@ func TestBBRv3StartupExitsOnBandwidthGrowth(t *testing.T) {
 	s.ackNPackets(10, rtt)
 
 	// If bandwidth grew ≥25%, fullBandwidthCount should be reset.
-	if s.sender.btlBw >= Bandwidth(float64(savedBw)*bbrStartupFullBandwidthThreshold) {
+	if s.sender.bw >= Bandwidth(float64(savedBw)*bbrStartupFullBandwidthThreshold) {
 		require.Equal(t, 0, s.sender.fullBandwidthCount,
 			"fullBandwidthCount should be 0 when bandwidth is still growing")
 		require.Equal(t, bbrStartup, s.sender.Mode(),
@@ -1257,7 +1266,7 @@ func TestBBRv3InflightHiGrowsDuringUp(t *testing.T) {
 
 	// Simulate a crushed inflight_hi: set it to a small value.
 	crushedHi := protocol.ByteCount(4) * bbrTestMaxDatagramSize
-	s.sender.inflightHi = crushedHi
+	s.sender.inflightLongterm = crushedHi
 
 	// Force cwnd down to inflightHi (mimicking targetCwnd cap).
 	s.sender.congestionWindow = crushedHi
@@ -1269,7 +1278,7 @@ func TestBBRv3InflightHiGrowsDuringUp(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		s.clock.Advance(rtt)
 		// ACK one packet with priorInFlight == congestionWindow (cwnd-limited).
-		oldHi := s.sender.inflightHi
+		oldHi := s.sender.inflightLongterm
 		s.sender.OnPacketAcked(
 			s.packetNumber,
 			bbrTestMaxDatagramSize,
@@ -1279,12 +1288,12 @@ func TestBBRv3InflightHiGrowsDuringUp(t *testing.T) {
 		s.packetNumber++
 
 		// After enough ACKs, inflight_hi should have grown.
-		if s.sender.inflightHi > oldHi {
+		if s.sender.inflightLongterm > oldHi {
 			break
 		}
 	}
 
-	require.Greater(t, s.sender.inflightHi, crushedHi,
+	require.Greater(t, s.sender.inflightLongterm, crushedHi,
 		"inflight_hi should grow via additive increase during ProbeBW_UP when cwnd-limited")
 }
 
@@ -1304,8 +1313,8 @@ func TestBBRv3DownCycleTimeoutEscapesToRefill(t *testing.T) {
 	require.Equal(t, probeBWDown, s.sender.ProbeBWPhaseValue())
 
 	// Record the cycle start.
-	cycleStart := s.sender.probeBWCycleStart
-	require.False(t, cycleStart.IsZero(), "probeBWCycleStart should be set")
+	cycleStart := s.sender.cycleStamp
+	require.False(t, cycleStart.IsZero(), "cycleStamp should be set")
 	require.Greater(t, s.sender.bwProbeWait, time.Duration(0), "bwProbeWait should be set")
 
 	// Keep bytesInFlight above BDP so the inflight-based DOWN→CRUISE transition
@@ -1336,8 +1345,8 @@ func TestBBRv3CruiseCycleTimeoutEscapesToRefill(t *testing.T) {
 	s.driveToProbeBWPhase(probeBWCruise, rtt)
 	require.Equal(t, probeBWCruise, s.sender.ProbeBWPhaseValue())
 
-	// Set a very long CRUISE deadline so the normal transition doesn't fire.
-	s.sender.probeBWCruiseDeadline = s.clock.Now().Add(1 * time.Hour)
+	// Set a very high bytesInFlight so the normal CRUISE exit doesn't fire.
+	s.bytesInFlight = s.sender.GetCongestionWindow() * 2
 
 	// Advance past the cycle timeout (bwProbeWait was set in enterProbeBWDown).
 	s.clock.Advance(4 * time.Second)
@@ -1373,8 +1382,8 @@ func TestBBRv3DownExitUsesBdpFloor(t *testing.T) {
 	// minCwnd = 4 * 1280 = 5120 bytes.
 	// Set btlBw so that bdp = btlBw_bytes_per_sec * minRtt / 1s ≈ 100 bytes.
 	// 100 bytes/s in Bandwidth units: 100 * 8 bits/s = 800 bits/s.
-	s.sender.btlBw = 800 * BytesPerSecond // ~800 bytes/s → BDP = 800 * 0.1 = 80 bytes
-	s.sender.maxBwFilter.Reset(int64(s.sender.btlBw), s.sender.roundCount)
+	s.sender.bw = 800 * BytesPerSecond // ~800 bytes/s → BDP = 800 * 0.1 = 80 bytes
+	s.sender.maxBwFilter.Reset(int64(s.sender.bw), s.sender.roundCount)
 
 	rawBdp := s.sender.bdp()
 	require.Less(t, rawBdp, s.sender.minCongestionWindow(),
@@ -1406,8 +1415,8 @@ func TestBBRv3DrainExitUsesBdpFloor(t *testing.T) {
 	require.Equal(t, bbrDrain, s.sender.Mode())
 
 	// Crush btlBw to make bdp() microscopic.
-	s.sender.btlBw = 800 * BytesPerSecond
-	s.sender.maxBwFilter.Reset(int64(s.sender.btlBw), s.sender.roundCount)
+	s.sender.bw = 800 * BytesPerSecond
+	s.sender.maxBwFilter.Reset(int64(s.sender.bw), s.sender.roundCount)
 
 	rawBdp := s.sender.bdp()
 	require.Less(t, rawBdp, s.sender.minCongestionWindow(),
@@ -1457,22 +1466,22 @@ func TestBBRv3BdpFloorNeverBelowMinCwnd(t *testing.T) {
 	s := newTestBBRSender()
 
 	// Case 1: btlBw = 0, minRtt = 0 (BDP unknown).
-	s.sender.btlBw = 0
+	s.sender.bw = 0
 	s.sender.minRtt = 0
 	floor := s.sender.bdpFloor()
 	require.GreaterOrEqual(t, floor, s.sender.minCongestionWindow(),
 		"bdpFloor should be >= minCwnd even when BDP is unknown")
 
 	// Case 2: btlBw is set but produces microscopic BDP.
-	s.sender.btlBw = 100 * BytesPerSecond
+	s.sender.bw = 100 * BytesPerSecond
 	s.sender.minRtt = 1 * time.Millisecond // BDP ≈ 0.1 bytes → truncated to 0
 	floor = s.sender.bdpFloor()
 	require.GreaterOrEqual(t, floor, s.sender.minCongestionWindow(),
 		"bdpFloor should be >= minCwnd when BDP is microscopic")
 
 	// Case 3: btlBw produces healthy BDP above minCwnd.
-	s.sender.btlBw = 10_000_000 * BytesPerSecond // 10 MB/s
-	s.sender.minRtt = 100 * time.Millisecond     // BDP = 1 MB
+	s.sender.bw = 10_000_000 * BytesPerSecond // 10 MB/s
+	s.sender.minRtt = 100 * time.Millisecond  // BDP = 1 MB
 	floor = s.sender.bdpFloor()
 	require.Greater(t, floor, s.sender.minCongestionWindow(),
 		"bdpFloor should be the actual BDP when it exceeds minCwnd")

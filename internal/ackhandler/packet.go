@@ -31,6 +31,7 @@ type packet struct {
 	deliveredTimeAtSend monotime.Time      // deliveredTime when this packet was sent
 	firstSentTimeAtSend monotime.Time      // send time of first packet in flight when this was sent
 	isAppLimitedAtSend  bool               // whether the connection was app-limited at send time
+	bytesInFlightAtSend protocol.ByteCount // C.inflight when this packet was sent (for BBRv3 tx_in_flight)
 }
 
 func (p *packet) Outstanding() bool {
@@ -58,6 +59,7 @@ func getPacket() *packet {
 	p.deliveredTimeAtSend = 0
 	p.firstSentTimeAtSend = 0
 	p.isAppLimitedAtSend = false
+	p.bytesInFlightAtSend = 0
 	return p
 }
 
