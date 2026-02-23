@@ -62,7 +62,8 @@ func (s *testBBRSender) sendPacket() {
 	// Snapshot delivery state before send (mirrors sent_packet_handler).
 	// Clear app-limited once pipe fills (matches production code).
 	if s.bytesInFlight >= s.sender.GetCongestionWindow() {
-		s.estimator.SetAppLimited(false)
+		s.estimator.ClearAppLimited()
+		s.sender.SetAppLimited(false)
 	}
 	ds := s.estimator.OnPacketSent(s.clock.Now(), s.bytesInFlight)
 	s.pktStates[s.packetNumber] = pktSnapshot{state: ds, sendTime: s.clock.Now()}
@@ -81,7 +82,9 @@ func (s *testBBRSender) sendNPackets(n int) {
 // sendAppLimitedPacket sends a packet while the connection is explicitly
 // marked as app-limited (simulating MarkAppLimited() from the send loop).
 func (s *testBBRSender) sendAppLimitedPacket() {
-	s.estimator.SetAppLimited(true)
+	threshold := s.estimator.Delivered() + s.bytesInFlight
+	s.estimator.MarkAppLimited(threshold)
+	s.sender.SetAppLimited(true)
 	ds := s.estimator.OnPacketSent(s.clock.Now(), s.bytesInFlight)
 	s.pktStates[s.packetNumber] = pktSnapshot{state: ds, sendTime: s.clock.Now()}
 
@@ -1485,4 +1488,150 @@ func TestBBRv3BdpFloorNeverBelowMinCwnd(t *testing.T) {
 	floor = s.sender.bdpFloor()
 	require.Greater(t, floor, s.sender.minCongestionWindow(),
 		"bdpFloor should be the actual BDP when it exceeds minCwnd")
+}
+
+// ---------- Idle Restart Tests ----------
+
+func TestBBRv3IdleRestartSetsFlag(t *testing.T) {
+	// After an idle period (inflight=0, app-limited), handleRestartFromIdle
+	// should set idle_restart=true to suppress ProbeRTT entry.
+	s := newTestBBRSender()
+	rtt := 50 * time.Millisecond
+
+	s.driveToState(bbrProbeBW, rtt)
+	require.False(t, s.sender.idleRestart)
+
+	// Simulate idle: drain all inflight, mark app-limited.
+	s.bytesInFlight = 0
+	s.sender.SetAppLimited(true)
+	s.sender.connAppLimited = true
+
+	// Send a new packet — should trigger handleRestartFromIdle.
+	s.sendPacket()
+	require.True(t, s.sender.idleRestart, "idle_restart should be set when resuming from idle")
+}
+
+func TestBBRv3IdleRestartSuppressesProbeRTT(t *testing.T) {
+	// When idle_restart is true, entering ProbeRTT should be suppressed
+	// until the first ACK clears the flag.
+	s := newTestBBRSender()
+	rtt := 50 * time.Millisecond
+
+	s.driveToState(bbrProbeBW, rtt)
+	require.Equal(t, bbrProbeBW, s.sender.mode)
+
+	// Force ProbeRTT expiration.
+	s.sender.probeRttExpired = true
+
+	// Without idle_restart, checkProbeRTT would enter ProbeRTT.
+	// With idle_restart=true, it should be suppressed.
+	s.sender.idleRestart = true
+	s.sender.checkProbeRTT(s.clock.Now())
+	require.NotEqual(t, bbrProbeRTT, s.sender.mode,
+		"ProbeRTT should be suppressed during idle restart")
+}
+
+func TestBBRv3IdleRestartClearsOnDelivery(t *testing.T) {
+	// idle_restart should clear after the first delivered ACK.
+	s := newTestBBRSender()
+	rtt := 50 * time.Millisecond
+
+	s.driveToState(bbrProbeBW, rtt)
+
+	// Set idle_restart.
+	s.sender.idleRestart = true
+	// Ensure delivery progress triggers clearing.
+	s.sender.lastDelivered = 100
+	s.sender.deliveredAtRoundStart = 50 // lastDelivered > deliveredAtRoundStart
+	s.sender.probeRttExpired = false    // don't trigger ProbeRTT
+
+	s.sender.checkProbeRTT(s.clock.Now())
+	require.False(t, s.sender.idleRestart,
+		"idle_restart should clear when RS.delivered > 0")
+}
+
+func TestBBRv3IdleRestartPacingGain(t *testing.T) {
+	// During idle restart in ProbeBW, pacing_gain should be set to 1.0.
+	s := newTestBBRSender()
+	rtt := 50 * time.Millisecond
+
+	s.driveToState(bbrProbeBW, rtt)
+
+	// The ProbeBW phase may have set a different pacing_gain.
+	s.sender.pacingGain = 0.9 // e.g., ProbeBW_DOWN gain
+
+	// Simulate idle conditions.
+	s.bytesInFlight = 0
+	s.sender.lastBytesInFlight = 0
+	s.sender.SetAppLimited(true)
+	s.sender.connAppLimited = true
+
+	// Call handleRestartFromIdle directly.
+	s.sender.handleRestartFromIdle()
+	require.Equal(t, 1.0, s.sender.pacingGain,
+		"pacing_gain should be 1.0 during idle restart in ProbeBW")
+}
+
+func TestBBRv3MaxBwPreservedDuringIdleRestart(t *testing.T) {
+	// maxBw should not be updated during idle restart (pipe hasn't refilled),
+	// preventing low-quality samples from degrading the bandwidth estimate.
+	s := newTestBBRSender()
+	rtt := 50 * time.Millisecond
+
+	s.driveToState(bbrProbeBW, rtt)
+	savedMaxBw := s.sender.maxBw
+	require.True(t, savedMaxBw > 0)
+
+	// Set idle_restart.
+	s.sender.idleRestart = true
+
+	// Feed a low-rate non-app-limited sample.
+	lowSample := RateSample{
+		DeliveryRate: savedMaxBw / 10, // 10% of maxBw
+		IsAppLimited: false,
+	}
+	s.sender.updateMaxBw(lowSample)
+	require.Equal(t, savedMaxBw, s.sender.maxBw,
+		"maxBw should not change during idle_restart")
+}
+
+// ---------- Delivery-Based App-Limited Clearing Tests ----------
+
+func TestBBRv3DeliveryBasedAppLimitedClearing(t *testing.T) {
+	// app_limited should auto-clear in GenerateRateSample when delivered
+	// exceeds the threshold (spec §4.1.2.4).
+	e := NewDeliveryRateEstimator()
+	var now monotime.Time = 1_000_000_000
+
+	// Send some data to establish delivered counter.
+	for i := 0; i < 5; i++ {
+		state := e.OnPacketSent(now, 0)
+		now += monotime.Time(10 * time.Millisecond)
+		e.GenerateRateSample(state, now-monotime.Time(10*time.Millisecond), 1280, now)
+	}
+	// delivered should be 5*1280 = 6400
+	require.Equal(t, protocol.ByteCount(6400), e.Delivered())
+
+	// Mark app-limited with threshold = delivered + inflight = 6400 + 1000 = 7400.
+	e.MarkAppLimited(7400)
+	require.True(t, e.IsAppLimited())
+
+	// Send and ack one more packet: delivered becomes 7680 > 7400 → cleared.
+	state := e.OnPacketSent(now, 1000)
+	require.True(t, state.IsAppLimited, "packet should be tagged app-limited")
+
+	now += monotime.Time(10 * time.Millisecond)
+	sample := e.GenerateRateSample(state, now-monotime.Time(10*time.Millisecond), 1280, now)
+	require.True(t, sample.IsAppLimited, "sample carries the send-time app-limited tag")
+	require.False(t, e.IsAppLimited(), "estimator should auto-clear once delivered > threshold")
+}
+
+func TestBBRv3AppLimitedConsumerInterface(t *testing.T) {
+	// Verify bbrv3Sender implements AppLimitedConsumer.
+	s := newTestBBRSender()
+	var _ AppLimitedConsumer = s.sender
+	s.sender.SetAppLimited(true)
+	require.True(t, s.sender.connAppLimited)
+	s.sender.SetAppLimited(false)
+	require.False(t, s.sender.connAppLimited)
 }

@@ -115,7 +115,7 @@ func TestDeliveryRateEstimatorAppLimited(t *testing.T) {
 	var now monotime.Time = 1_000_000_000
 
 	// Mark as app-limited, then send a packet.
-	e.SetAppLimited(true)
+	e.MarkAppLimited(1) // threshold = 1 (minimum when nothing delivered/inflight)
 	state := e.OnPacketSent(now, 0)
 	require.True(t, state.IsAppLimited, "snapshot should record app-limited state")
 
@@ -125,7 +125,7 @@ func TestDeliveryRateEstimatorAppLimited(t *testing.T) {
 	require.True(t, sample.IsAppLimited, "sample should be marked as app-limited")
 
 	// Clear app-limited, send a packet when NOT app-limited.
-	e.SetAppLimited(false)
+	e.ClearAppLimited()
 	now = ackTime
 	state2 := e.OnPacketSent(now, testPacketSize)
 	require.False(t, state2.IsAppLimited, "should not be app-limited")
@@ -240,4 +240,65 @@ func TestDeliveryRateEstimatorImmunityToACKAggregation(t *testing.T) {
 	ratioAB := float64(bestRateA) / float64(bestRateB)
 	require.InDelta(t, 1.0, ratioAB, 0.20,
 		"individual ACK rate (%v) vs batched ACK rate (%v) should be similar", bestRateA, bestRateB)
+}
+
+func TestDeliveryRateEstimatorMarkAppLimitedThreshold(t *testing.T) {
+	e := NewDeliveryRateEstimator()
+	var now monotime.Time = 1_000_000_000
+
+	// Initially not app-limited.
+	require.False(t, e.IsAppLimited())
+
+	// Mark with threshold.
+	e.MarkAppLimited(5000) // will clear when delivered > 5000
+	require.True(t, e.IsAppLimited())
+
+	// Deliver 4000 bytes — still below threshold.
+	for i := 0; i < 4; i++ {
+		s := e.OnPacketSent(now, 0)
+		now += monotime.Time(10 * time.Millisecond)
+		e.GenerateRateSample(s, now-monotime.Time(10*time.Millisecond), 1000, now)
+	}
+	require.True(t, e.IsAppLimited(), "should stay app-limited until delivered > threshold")
+
+	// Deliver 2000 more → total 6000 > 5000 → cleared.
+	for i := 0; i < 2; i++ {
+		s := e.OnPacketSent(now, 0)
+		now += monotime.Time(10 * time.Millisecond)
+		e.GenerateRateSample(s, now-monotime.Time(10*time.Millisecond), 1000, now)
+	}
+	require.False(t, e.IsAppLimited(), "should auto-clear when delivered exceeds threshold")
+}
+
+func TestDeliveryRateEstimatorMarkAppLimitedZeroThreshold(t *testing.T) {
+	e := NewDeliveryRateEstimator()
+
+	// MarkAppLimited with 0 should use minimum of 1 (spec: ? : 1).
+	e.MarkAppLimited(0)
+	require.True(t, e.IsAppLimited())
+
+	// Clearing condition is delivered > threshold. With threshold=1,
+	// need delivered > 1, so at least 2 bytes total acked.
+	now := monotime.Time(1_000_000_000)
+	s1 := e.OnPacketSent(now, 0)
+	now += monotime.Time(10 * time.Millisecond)
+	e.GenerateRateSample(s1, now-monotime.Time(10*time.Millisecond), 1, now)
+	// delivered=1, threshold=1. 1 > 1 is false — not yet cleared.
+	require.True(t, e.IsAppLimited(), "not cleared yet: delivered == threshold")
+
+	// Second ACK pushes delivered to 2 > 1 → cleared.
+	s2 := e.OnPacketSent(now, 0)
+	now += monotime.Time(10 * time.Millisecond)
+	e.GenerateRateSample(s2, now-monotime.Time(10*time.Millisecond), 1, now)
+	require.False(t, e.IsAppLimited(), "should clear after delivered > threshold")
+}
+
+func TestDeliveryRateEstimatorClearAppLimited(t *testing.T) {
+	e := NewDeliveryRateEstimator()
+
+	e.MarkAppLimited(10000)
+	require.True(t, e.IsAppLimited())
+
+	e.ClearAppLimited()
+	require.False(t, e.IsAppLimited())
 }

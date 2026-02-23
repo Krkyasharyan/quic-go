@@ -4,8 +4,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
-
-	// "os"
+	"os"
 	"time"
 
 	"github.com/quic-go/quic-go/internal/monotime"
@@ -18,8 +17,7 @@ import (
 // bbrDebugLog is checked once at process start. Set QUIC_BBR_DEBUG=1 to enable
 // per-ACK diagnostic logging to stderr. When false, logState is a single branch
 // on a package-level bool — effectively zero overhead.
-// var bbrDebugLog = os.Getenv("QUIC_BBR_DEBUG") == "1"
-var bbrDebugLog = true
+var bbrDebugLog = os.Getenv("QUIC_BBR_DEBUG") == "1"
 
 // ---------- BBR Mode (Top-Level State Machine) ----------
 
@@ -273,8 +271,10 @@ type bbrv3Sender struct {
 	probeRttDoneStamp monotime.Time
 	probeRttRoundDone bool
 	priorCwnd         protocol.ByteCount
-	disableProbeRTT   bool // application-level toggle
-	idleRestart       bool // spec §5.4
+	disableProbeRTT   bool               // application-level toggle
+	idleRestart       bool               // spec §5.4
+	connAppLimited    bool               // mirrors C.app_limited from sent_packet_handler
+	lastBytesInFlight protocol.ByteCount // last known bytes in flight (from OnPacketSent)
 
 	// --- Gains ---
 	pacingGain float64
@@ -396,11 +396,12 @@ func (b *bbrv3Sender) HasPacingBudget(now monotime.Time) bool {
 // OnPacketSent: spec §5.2.2 pre-transmit + delivery-rate snapshot.
 func (b *bbrv3Sender) OnPacketSent(
 	sentTime monotime.Time,
-	_ protocol.ByteCount,
+	bytesInFlight protocol.ByteCount,
 	packetNumber protocol.PacketNumber,
 	bytes protocol.ByteCount,
 	isRetransmittable bool,
 ) {
+	b.lastBytesInFlight = bytesInFlight
 	b.handleRestartFromIdle()
 	b.pacer.SentPacket(sentTime, bytes)
 	if !isRetransmittable {
@@ -675,6 +676,12 @@ func (b *bbrv3Sender) OnBandwidthSample(sample RateSample) {
 
 // updateMaxBw implements spec §5.5.5 BBRUpdateMaxBw.
 func (b *bbrv3Sender) updateMaxBw(sample RateSample) {
+	// Skip maxBw updates during idle restart: the pipe hasn't refilled yet,
+	// so delivery rate samples don't reflect true network capacity.
+	// The idle_restart flag is cleared after the first delivered ACK.
+	if b.idleRestart {
+		return
+	}
 	if sample.DeliveryRate > 0 &&
 		(sample.DeliveryRate >= b.maxBw || !sample.IsAppLimited) {
 		b.maxBwFilter.Update(int64(sample.DeliveryRate), b.cycleCount)
@@ -1359,12 +1366,32 @@ func (b *bbrv3Sender) exitProbeRTT() {
 	}
 }
 
-// --- Restart from Idle (spec §5.4) ---
+// --- Restart from Idle (spec §5.4.1) ---
 
+// handleRestartFromIdle implements BBRHandleRestartFromIdle.
+// Spec §5.4.1: when restarting from idle in ProbeBW, pace at exactly BBR.bw
+// to re-fill the pipe. When in ProbeRTT, check if exit conditions are met.
+// Critically, this sets idle_restart = true which suppresses immediate
+// ProbeRTT entry after an idle period — preventing the "burst + ProbeRTT =
+// catastrophic latency spike" scenario.
 func (b *bbrv3Sender) handleRestartFromIdle() {
-	// This would check C.inflight == 0 && C.app_limited, but we don't
-	// have inflight readily here. Let the delivery estimator handle app-limited.
-	// Minimal implementation for idle_restart flag.
+	if b.lastBytesInFlight == 0 && b.connAppLimited {
+		b.idleRestart = true
+		b.extraAckedIntervalStart = b.clock.Now()
+		if b.isInAProbeBWState() {
+			// Spec: BBRSetPacingRateWithGain(1) — pace at exactly bw, no gain.
+			b.pacingGain = 1.0
+		} else if b.mode == bbrProbeRTT {
+			b.checkProbeRTTDone(b.clock.Now())
+		}
+	}
+}
+
+// SetAppLimited is called by the sent_packet_handler to mirror the
+// C.app_limited state into the congestion controller. This is needed by
+// handleRestartFromIdle() which must check C.app_limited at transmit time.
+func (b *bbrv3Sender) SetAppLimited(limited bool) {
+	b.connAppLimited = limited
 }
 
 // --- cwnd save/restore (spec §5.6.4.4) ---

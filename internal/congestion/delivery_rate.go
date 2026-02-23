@@ -55,10 +55,12 @@ type DeliveryRateEstimator struct {
 	// firstSentTime is the send time of the first packet in the current
 	// flight (reset when bytesInFlight transitions from 0 to >0).
 	firstSentTime monotime.Time
-	// appLimited is true when the sender doesn't have enough data to fill
-	// the congestion window, meaning bandwidth samples during this period
-	// may underestimate the true bottleneck capacity.
-	appLimited bool
+	// appLimited is the value of (C.delivered + C.inflight) at the time the
+	// connection became application-limited, or 0 if not app-limited.
+	// Per spec §4.1.2.4: C.app_limited = (C.delivered + C.inflight) ? : 1
+	// This is cleared in GenerateRateSample when C.delivered > C.app_limited,
+	// indicating the "bubble" of idle time has exited the data pipeline.
+	appLimited protocol.ByteCount
 }
 
 // NewDeliveryRateEstimator creates a new estimator with zero state.
@@ -88,7 +90,7 @@ func (e *DeliveryRateEstimator) OnPacketSent(
 		Delivered:     e.delivered,
 		DeliveredTime: e.deliveredTime,
 		FirstSentTime: e.firstSentTime,
-		IsAppLimited:  e.appLimited,
+		IsAppLimited:  e.appLimited != 0,
 	}
 }
 
@@ -108,6 +110,12 @@ func (e *DeliveryRateEstimator) GenerateRateSample(
 	// Update connection-level counters.
 	e.delivered += ackedBytes
 	e.deliveredTime = now
+
+	// Spec §4.1.2.4: Clear app-limited field if bubble is ACKed and gone.
+	// if (C.app_limited and C.delivered > C.app_limited) C.app_limited = 0
+	if e.appLimited != 0 && e.delivered > e.appLimited {
+		e.appLimited = 0
+	}
 
 	// Compute elapsed intervals.
 	sendElapsed := pktSendTime.Sub(pktState.FirstSentTime)
@@ -147,14 +155,24 @@ func (e *DeliveryRateEstimator) GenerateRateSample(
 	}
 }
 
-// SetAppLimited marks the connection as application-limited (or not).
-func (e *DeliveryRateEstimator) SetAppLimited(limited bool) {
-	e.appLimited = limited
+// MarkAppLimited marks the connection as application-limited.
+// Per spec §4.1.2.4: C.app_limited = (C.delivered + C.inflight) ? : 1
+// The caller provides (delivered + bytesInFlight) as the threshold.
+func (e *DeliveryRateEstimator) MarkAppLimited(deliveredPlusInflight protocol.ByteCount) {
+	if deliveredPlusInflight == 0 {
+		deliveredPlusInflight = 1
+	}
+	e.appLimited = deliveredPlusInflight
+}
+
+// ClearAppLimited clears the application-limited state.
+func (e *DeliveryRateEstimator) ClearAppLimited() {
+	e.appLimited = 0
 }
 
 // IsAppLimited reports whether the connection is currently app-limited.
 func (e *DeliveryRateEstimator) IsAppLimited() bool {
-	return e.appLimited
+	return e.appLimited != 0
 }
 
 // Delivered returns the current cumulative delivered byte count.

@@ -33,3 +33,11 @@ type SendAlgorithmWithDebugInfos interface {
 type ECNCongestionConsumer interface {
 	OnECNCongestion(priorInFlight protocol.ByteCount)
 }
+
+// AppLimitedConsumer is optionally implemented by congestion controllers
+// (e.g. BBRv3) that need to know the connection-level app-limited state
+// for idle restart handling. Controllers that do not implement this
+// interface simply ignore app-limited notifications.
+type AppLimitedConsumer interface {
+	SetAppLimited(limited bool)
+}

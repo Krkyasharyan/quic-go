@@ -128,3 +128,91 @@ func TestWindowedFilterNewBestUpdatesAll(t *testing.T) {
 	require.Equal(t, int64(200), f.GetSecondBest())
 	require.Equal(t, int64(200), f.GetThirdBest())
 }
+
+// TestWindowedMaxFilterAmnesiaProtection verifies that when the best
+// sample expires, valid second-best samples are promoted instead of
+// resetting all three slots to the low incoming value.
+// This is the "bandwidth amnesia" fix.
+func TestWindowedMaxFilterAmnesiaProtection(t *testing.T) {
+	// Setup: best at cycle 1, differentiate second/third via quarter-window aging.
+	// Window=2, quarterWindow=max(2/4,1)=1. Aging fires when delta > 1, i.e. delta >= 2.
+	f := newWindowedFilter(2, true)
+	f.Reset(1000, 1)    // all at cycle 1: [1000@1, 1000@1, 1000@1]
+	f.Update(800, 3)    // quarter aging: 3-1=2 > 1 → second=800@3, third=800@3
+	                    // State: [1000@1, 800@3, 800@3]
+
+	require.Equal(t, int64(1000), f.GetBest(), "best preserved after aging")
+	require.Equal(t, int64(800), f.GetSecondBest(), "second aged")
+
+	// Low value at cycle 4:
+	// Third at 3: 4-3=1, NOT > 2. Third not expired.
+	// Best at 1: 4-1=3 > 2 → best expired!
+	// Case 5 fires: promote [800@3, 800@3, 50@4].
+	// Then check promoted best (800@3): 4-3=1, NOT > 2 → stop.
+	f.Update(50, 4)
+	require.Equal(t, int64(800), f.GetBest(), "should promote second-best, not reset to low value")
+}
+
+// TestWindowedMaxFilterThirdOnlyExpiry tests the case where only the third-best
+// expires while best and second are still valid.
+func TestWindowedMaxFilterThirdOnlyExpiry(t *testing.T) {
+	f := newWindowedFilter(5, true)
+
+	f.Reset(500, 1)
+	// Use quarter-window aging to install different values in second/third.
+	f.Update(400, 3) // 3-1=2 > 5/4=1 → quarter aging: second=400@3, third=400@3
+	f.Update(300, 5) // 5-3=2 > 5/2=2? No (NOT > 2). third stays. But 300 < 400, no update.
+
+	// State: [500@1, 400@3, 400@3]
+	// Third at round 3: 7-3=4 < 5. Not expired.
+	// But at round 9: 9-3=6 > 5. Third expired.
+	// Best at 1: 9-1=8 > 5. Best expired too.
+	// Second at 3: 9-3=6 > 5. Second expired too.
+	f.Update(200, 9)
+	// All expired → Reset.
+	require.Equal(t, int64(200), f.GetBest())
+
+	// Now: partial expiry where best is still valid.
+	f3 := newWindowedFilter(5, true)
+	f3.Reset(500, 5)
+	f3.Update(400, 7) // 7-5=2 > 5/4=1 → quarter aging: second=400@7, third=400@7
+	// State: [500@5, 400@7, 400@7]
+	// At round 13: 13-7=6 > 5 → third expired. Best: 13-5=8 > 5 → expired too.
+	// Second: 13-7=6 > 5 → expired.
+	f3.Update(100, 13)
+	require.Equal(t, int64(100), f3.GetBest(), "all expired → reset to new value")
+
+	// Partial: only third expired, best and second valid.
+	f4 := newWindowedFilter(5, true)
+	f4.Reset(500, 10)
+	f4.Update(400, 12) // quarter aging: second=400@12
+	// State: [500@10, 400@12, 400@12]
+	// At round 18: third at 12: 18-12=6 > 5 → expired.
+	//              best at 10: 18-10=8 > 5 → expired.
+	//              second at 12: 18-12=6 > 5 → expired.
+	f4.Update(100, 18)
+	require.Equal(t, int64(100), f4.GetBest(), "all expired → reset")
+}
+
+// TestWindowedFilterQuarterWindowMinThreshold verifies that quarter-window
+// aging uses a minimum threshold of 1, preventing degenerate behavior with
+// small window lengths (e.g., MaxBwFilterLen=2 gives windowLength/4=0).
+func TestWindowedFilterQuarterWindowMinThreshold(t *testing.T) {
+	f := newWindowedFilter(2, true) // window=2, raw quarter=0, min=1
+
+	f.Reset(1000, 0) // all three at [1000@0, 1000@0, 1000@0]
+
+	// Without the min threshold fix, windowLength/4=0 would mean delta > 0
+	// is always true, causing immediate aging at every Update.
+	// With min threshold=1, aging requires delta > 1, so Update at round 1
+	// should NOT trigger aging (1-0=1, NOT > 1).
+	f.Update(100, 1)
+	require.Equal(t, int64(1000), f.GetBest(), "best preserved")
+	require.Equal(t, int64(1000), f.GetSecondBest(), "second NOT aged at delta=1")
+
+	// At round 2: delta=2-0=2 > 1 → aging fires, second becomes 100.
+	f.Update(100, 2)
+	require.Equal(t, int64(1000), f.GetBest(), "best still preserved")
+	require.Equal(t, int64(100), f.GetSecondBest(), "second-best aged at delta=2")
+	require.Equal(t, int64(100), f.GetThirdBest(), "third-best also aged")
+}

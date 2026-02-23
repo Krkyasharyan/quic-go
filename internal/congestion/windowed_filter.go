@@ -60,50 +60,93 @@ func (f *windowedFilter) Reset(value, round int64) {
 }
 
 // Update updates the filter with a new sample.
-// This follows the Chromium WindowedFilter algorithm.
+// This implements the Kathleen Nichols windowed min/max algorithm with a
+// fix for the "bandwidth amnesia" problem: when the oldest sample expires
+// and the incoming value is NOT a new best, we promote remaining valid
+// samples rather than resetting all three slots to the (potentially low)
+// incoming value. This prevents a single low-quality sample from wiping
+// out high-quality historical measurements in the max filter.
 func (f *windowedFilter) Update(value, round int64) {
-	// Reset if: not initialized, new best, or third-best expired.
-	if f.samples[0].value == 0 ||
-		f.better(value, f.samples[0].value) ||
-		round-f.samples[2].round > f.windowLength {
+	newSample := windowedSample{value: value, round: round}
+
+	// Case 1: Not initialized — accept unconditionally.
+	if f.samples[0].value == 0 {
 		f.Reset(value, round)
 		return
 	}
 
-	// Try to update second and third best.
-	if f.better(value, f.samples[1].value) {
-		f.samples[1] = windowedSample{value: value, round: round}
-		f.samples[2] = f.samples[1]
-	} else if f.better(value, f.samples[2].value) {
-		f.samples[2] = windowedSample{value: value, round: round}
+	// Case 2: New best — replace everything.
+	if f.better(value, f.samples[0].value) {
+		f.Reset(value, round)
+		return
 	}
 
-	// Expire and promote estimates as needed.
-	if round-f.samples[0].round > f.windowLength {
-		// Best has expired — promote.
-		f.samples[0] = f.samples[1]
-		f.samples[1] = f.samples[2]
-		f.samples[2] = windowedSample{value: value, round: round}
-		// Check again: if the new best (formerly second-best) also expired.
+	// Case 3: Expiration handling. Check each slot from oldest (third) to
+	// newest (best) and handle expired samples by promoting what's left.
+	// This avoids the original algorithm's unconditional Reset on third-best
+	// expiry, which caused "bandwidth amnesia" in max filters.
+	if round-f.samples[2].round > f.windowLength {
 		if round-f.samples[0].round > f.windowLength {
-			f.samples[0] = f.samples[1]
-			f.samples[1] = f.samples[2]
+			// All three expired. No valid historical data remains.
+			f.Reset(value, round)
+			return
+		}
+		if round-f.samples[1].round > f.windowLength {
+			// Best still valid, second and third expired.
+			f.samples[1] = newSample
+			f.samples[2] = newSample
+		} else {
+			// Best and second still valid, only third expired.
+			f.samples[2] = newSample
 		}
 		return
 	}
 
-	// Quarter-window aging: if second-best still equals best and enough time
-	// has passed, replace it with the current sample as a more recent fallback.
-	if f.samples[1].value == f.samples[0].value &&
-		round-f.samples[1].round > f.windowLength/4 {
-		f.samples[1] = windowedSample{value: value, round: round}
-		f.samples[2] = f.samples[1]
+	// Case 4: No expiration — try to update second and third best.
+	if f.better(value, f.samples[1].value) {
+		f.samples[1] = newSample
+		f.samples[2] = newSample
+	} else if f.better(value, f.samples[2].value) {
+		f.samples[2] = newSample
+	}
+
+	// Case 5: Best has expired (but third hasn't — this happens when best
+	// is much older than second/third). Promote and replace.
+	if round-f.samples[0].round > f.windowLength {
+		f.samples[0] = f.samples[1]
+		f.samples[1] = f.samples[2]
+		f.samples[2] = newSample
+		// Check again: if the promoted best (formerly second) also expired.
+		if round-f.samples[0].round > f.windowLength {
+			f.samples[0] = f.samples[1]
+			f.samples[1] = newSample
+		}
 		return
 	}
 
-	// Half-window aging: same for third-best relative to second-best.
+	// Case 6: Quarter-window aging — if second-best still equals best and
+	// enough time has passed, replace it with the current sample as a more
+	// recent fallback. Ensure minimum threshold of 1 to prevent degenerate
+	// behavior when windowLength is small (e.g., MaxBwFilterLen=2 gives
+	// windowLength/4=0, causing immediate aging).
+	quarterWindow := f.windowLength / 4
+	if quarterWindow < 1 {
+		quarterWindow = 1
+	}
+	if f.samples[1].value == f.samples[0].value &&
+		round-f.samples[1].round > quarterWindow {
+		f.samples[1] = newSample
+		f.samples[2] = newSample
+		return
+	}
+
+	// Case 7: Half-window aging — same for third-best relative to second-best.
+	halfWindow := f.windowLength / 2
+	if halfWindow < 1 {
+		halfWindow = 1
+	}
 	if f.samples[2].value == f.samples[1].value &&
-		round-f.samples[2].round > f.windowLength/2 {
-		f.samples[2] = windowedSample{value: value, round: round}
+		round-f.samples[2].round > halfWindow {
+		f.samples[2] = newSample
 	}
 }
