@@ -1610,9 +1610,10 @@ func TestBBRv3IdleRestartPacingGain(t *testing.T) {
 }
 
 func TestBBRv3MaxBwPreservedDuringIdleRestart(t *testing.T) {
-	// maxBw should be preserved during idle restart because app-limited
-	// samples are filtered by updateMaxBw (rate < maxBw AND IsAppLimited
-	// → not admitted). This is the spec-correct protection mechanism.
+	// During idle restart the pipe is refilling — delivery rate samples are
+	// artificially low. The idle_restart guard on updateMaxBw prevents these
+	// junk samples from corrupting the filter. Once idle_restart clears
+	// (after delivery progress), normal samples are admitted again.
 	s := newTestBBRSender()
 	rtt := 50 * time.Millisecond
 
@@ -1620,24 +1621,73 @@ func TestBBRv3MaxBwPreservedDuringIdleRestart(t *testing.T) {
 	savedMaxBw := s.sender.maxBw
 	require.True(t, savedMaxBw > 0)
 
-	// Feed a low-rate app-limited sample (simulates post-idle delivery).
-	// App-limited + below maxBw → should NOT be admitted to filter.
-	lowSample := RateSample{
-		DeliveryRate: savedMaxBw / 10, // 10% of maxBw
-		IsAppLimited: true,
-	}
-	s.sender.updateMaxBw(lowSample)
-	require.Equal(t, savedMaxBw, s.sender.maxBw,
-		"maxBw should not change for low app-limited samples")
+	// Simulate idle restart: set idleRestart flag.
+	s.sender.idleRestart = true
 
-	// Non-app-limited samples above maxBw SHOULD be admitted.
+	// Even a high non-app-limited sample should be BLOCKED by idle_restart.
 	highSample := RateSample{
 		DeliveryRate: savedMaxBw * 2,
 		IsAppLimited: false,
 	}
 	s.sender.updateMaxBw(highSample)
+	require.Equal(t, savedMaxBw, s.sender.maxBw,
+		"maxBw must not change while idleRestart is true")
+
+	// Clear idle restart and verify normal admission resumes.
+	s.sender.idleRestart = false
+	s.sender.updateMaxBw(highSample)
 	require.Equal(t, savedMaxBw*2, s.sender.maxBw,
-		"maxBw should update for high non-app-limited samples")
+		"maxBw should update once idleRestart clears")
+
+	// Also verify app-limited + below-maxBw is still filtered (secondary defense).
+	lowAppLimited := RateSample{
+		DeliveryRate: savedMaxBw / 10,
+		IsAppLimited: true,
+	}
+	savedMaxBw2 := s.sender.maxBw
+	s.sender.updateMaxBw(lowAppLimited)
+	require.Equal(t, savedMaxBw2, s.sender.maxBw,
+		"low app-limited samples should not be admitted")
+}
+
+func TestBBRv3CycleCountAdvancesOncePerCycle(t *testing.T) {
+	// Verify that cycleCount increments exactly once when entering
+	// ProbeBW_DOWN (via adaptLongTermModel), not once per round.
+	// This is the fix for the "bandwidth amnesia" bug where ackPhase
+	// stayed acksProbeStopping across DOWN and CRUISE, causing the
+	// maxBw filter to expire all samples within ~3 rounds.
+	s := newTestBBRSender()
+	rtt := 50 * time.Millisecond
+
+	s.driveToState(bbrProbeBW, rtt)
+
+	// Record initial state.
+	initialCycleCount := s.sender.cycleCount
+
+	// Enter ProbeBW_DOWN which sets ackPhase = acksProbeStopping.
+	s.sender.startProbeBWDown()
+	require.Equal(t, acksProbeStopping, s.sender.ackPhase)
+
+	// Simulate first round with a non-app-limited sample.
+	s.sender.newRoundSinceLastBwSample = true
+	sample := RateSample{
+		DeliveryRate: s.sender.maxBw,
+		IsAppLimited: false,
+	}
+	s.sender.adaptLongTermModel(sample)
+
+	// cycleCount should have incremented ONCE.
+	require.Equal(t, initialCycleCount+1, s.sender.cycleCount,
+		"cycleCount should advance once on first round in DOWN")
+	// ackPhase should have transitioned to acksInit.
+	require.Equal(t, acksInit, s.sender.ackPhase,
+		"ackPhase must transition to acksInit after advancing filter")
+
+	// Simulate a second round — cycleCount should NOT increment again.
+	s.sender.newRoundSinceLastBwSample = true
+	s.sender.adaptLongTermModel(sample)
+	require.Equal(t, initialCycleCount+1, s.sender.cycleCount,
+		"cycleCount must not advance again while ackPhase is acksInit")
 }
 
 // ---------- Delivery-Based App-Limited Clearing Tests ----------

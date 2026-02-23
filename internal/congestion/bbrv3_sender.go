@@ -675,12 +675,16 @@ func (b *bbrv3Sender) OnBandwidthSample(sample RateSample) {
 }
 
 // updateMaxBw implements spec §5.5.5 BBRUpdateMaxBw.
-// NOTE: the spec does NOT guard this with idle_restart. Post-idle samples
-// are protected by the IsAppLimited tag (which prevents low-quality idle
-// samples from being admitted) and by the cycle advancement guard in
-// adaptLongTermModel (which prevents cycleCount from advancing on
-// app-limited samples). Together these preserve the filter during idle.
+// During idle restart, the pipe hasn't refilled so delivery rate samples
+// are artificially low. Skip filter updates until idle_restart clears
+// (which happens after the first delivery progress in checkProbeRTT).
+// This is safe because cycleCount only advances once per ProbeBW cycle
+// (not per round), so the filter won't age out during the brief idle
+// restart period.
 func (b *bbrv3Sender) updateMaxBw(sample RateSample) {
+	if b.idleRestart {
+		return
+	}
 	if sample.DeliveryRate > 0 &&
 		(sample.DeliveryRate >= b.maxBw || !sample.IsAppLimited) {
 		b.maxBwFilter.Update(int64(sample.DeliveryRate), b.cycleCount)
@@ -706,6 +710,12 @@ func (b *bbrv3Sender) adaptLongTermModel(sample RateSample) {
 		if b.isInAProbeBWState() && !sample.IsAppLimited {
 			b.advanceMaxBwFilter()
 		}
+		// Spec: ack_phase = ACKS_INIT after processing the stopping phase.
+		// Without this transition, cycleCount increments EVERY round while
+		// ackPhase stays acksProbeStopping (across DOWN and CRUISE), causing
+		// the maxBw filter to expire all samples within ~3 rounds instead of
+		// ~3 ProbeBW cycles. This was the root cause of "bandwidth amnesia".
+		b.ackPhase = acksInit
 	}
 
 	if !b.isInflightTooHigh(sample) {
@@ -744,8 +754,18 @@ func (b *bbrv3Sender) updateACKAggregation(sample RateSample) {
 	if b.extraAckedDelivered > expectedDelivered {
 		extra = b.extraAckedDelivered - expectedDelivered
 	}
-	if extra > b.congestionWindow {
-		extra = b.congestionWindow
+	// Cap extra_acked. During Startup, cap at a BDP-based target instead of
+	// cwnd to prevent a positive feedback loop where cwnd → extraAcked →
+	// maxInflight → cwnd. In steady-state, use cwnd per spec §5.5.9.
+	extraAckedCap := b.congestionWindow
+	if !b.fullBwReached {
+		extraAckedCap = b.bdpMultiple(b.cwndGain)
+		if extraAckedCap < b.minCongestionWindow() {
+			extraAckedCap = b.minCongestionWindow()
+		}
+	}
+	if extra > extraAckedCap {
+		extra = extraAckedCap
 	}
 
 	filterLen := int64(bbrExtraAckedFilterLen)
