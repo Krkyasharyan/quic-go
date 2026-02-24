@@ -41,20 +41,26 @@ func newTestBBRSender() *testBBRSender {
 	clock = mockClock(monotime.Time(1_000_000_000))
 
 	rttStats := utils.NewRTTStats()
+	estimator := NewDeliveryRateEstimator()
+
+	sender := NewBBRv3Sender(
+		&clock,
+		rttStats,
+		&utils.ConnectionStats{},
+		bbrTestMaxDatagramSize,
+		nil, // no qlogger
+	)
+	// Wire the delivery-rate estimator so BBR can call MarkConnectionAppLimited()
+	// during ProbeRTT (matching production wiring in sent_packet_handler).
+	sender.SetAppLimitedSetter(estimator)
 
 	return &testBBRSender{
 		clock:        &clock,
 		rttStats:     rttStats,
 		packetNumber: 1,
-		estimator:    NewDeliveryRateEstimator(),
+		estimator:    estimator,
 		pktStates:    make(map[protocol.PacketNumber]pktSnapshot),
-		sender: NewBBRv3Sender(
-			&clock,
-			rttStats,
-			&utils.ConnectionStats{},
-			bbrTestMaxDatagramSize,
-			nil, // no qlogger
-		),
+		sender:       sender,
 	}
 }
 
@@ -1485,4 +1491,185 @@ func TestBBRv3BdpFloorNeverBelowMinCwnd(t *testing.T) {
 	floor = s.sender.bdpFloor()
 	require.Greater(t, floor, s.sender.minCongestionWindow(),
 		"bdpFloor should be the actual BDP when it exceeds minCwnd")
+}
+
+// TestBBRv3ProbeRTTDoesNotCollapseMaxBw verifies that the fix for spec §5.3.4.3
+// MarkConnectionAppLimited() prevents the maxBw filter from being poisoned
+// by low delivery-rate samples observed during ProbeRTT's reduced cwnd.
+//
+// This is the primary regression test for the "4K stagnation" bug where
+// maxBw dropped from ~6.8 MB/s to ~20 KB/s and never recovered.
+func TestBBRv3ProbeRTTDoesNotCollapseMaxBw(t *testing.T) {
+	s := newTestBBRSender()
+	rtt := 50 * time.Millisecond
+
+	// 1. Drive to ProbeBW and establish a good maxBw.
+	s.driveToState(bbrProbeBW, rtt)
+	require.Equal(t, bbrProbeBW, s.sender.Mode())
+
+	// Record the healthy maxBw established during Startup/ProbeBW.
+	healthyMaxBw := s.sender.MaxBw()
+	require.Greater(t, healthyMaxBw, Bandwidth(0),
+		"maxBw should be non-zero after reaching ProbeBW")
+	t.Logf("healthy maxBw = %d bits/s (%d KB/s)", healthyMaxBw, healthyMaxBw/BytesPerSecond/1024)
+
+	// 2. Force entry into ProbeRTT by setting timestamps far in the past.
+	s.sender.minRttStamp = s.clock.Now().Add(-11 * time.Second)
+	s.sender.probeRttMinStamp = s.clock.Now().Add(-6 * time.Second)
+
+	// Send + ACK to trigger updateMinRtt → probeRttExpired → checkProbeRTT → enterProbeRTT.
+	higherRtt := 200 * time.Millisecond
+	s.sendNPackets(1)
+	s.clock.Advance(higherRtt)
+	s.ackNPackets(1, higherRtt)
+	require.Equal(t, bbrProbeRTT, s.sender.Mode(),
+		"should have entered ProbeRTT")
+
+	// 3. Simulate several round trips IN ProbeRTT.
+	// During ProbeRTT, cwnd is reduced to 0.5*BDP, so delivery rates will be low.
+	// The critical invariant: these low samples must be app-limited.
+	for i := 0; i < 8; i++ {
+		if s.sender.CanSend(s.bytesInFlight) {
+			s.sendNPackets(1)
+		}
+		s.clock.Advance(rtt)
+		if s.bytesInFlight > 0 {
+			s.ackNPackets(1, rtt)
+		}
+	}
+
+	// 4. Drive through ProbeRTT exit (duration + round completion).
+	s.clock.Advance(bbrProbeRTTDuration + rtt)
+	for i := 0; i < 15; i++ {
+		if s.sender.Mode() != bbrProbeRTT {
+			break
+		}
+		if s.sender.CanSend(s.bytesInFlight) {
+			s.sendNPackets(1)
+		}
+		s.clock.Advance(rtt)
+		if s.bytesInFlight > 0 {
+			s.ackNPackets(1, rtt)
+		}
+	}
+	require.NotEqual(t, bbrProbeRTT, s.sender.Mode(),
+		"should have exited ProbeRTT by now")
+
+	// 5. THE CRITICAL CHECK: maxBw must NOT have collapsed.
+	postProbeRTTMaxBw := s.sender.MaxBw()
+	t.Logf("post-ProbeRTT maxBw = %d bits/s (%d KB/s)", postProbeRTTMaxBw, postProbeRTTMaxBw/BytesPerSecond/1024)
+
+	// Allow some tolerance (50%) but absolutely no catastrophic collapse.
+	// Before the fix, maxBw would drop to <1% of the healthy value.
+	minAcceptable := Bandwidth(float64(healthyMaxBw) * 0.5)
+	require.GreaterOrEqual(t, postProbeRTTMaxBw, minAcceptable,
+		"maxBw should NOT collapse after ProbeRTT (was %d, now %d, min acceptable %d)",
+		healthyMaxBw, postProbeRTTMaxBw, minAcceptable)
+}
+
+// TestBBRv3ProbeRTTSamplesMarkedAppLimited verifies that during ProbeRTT,
+// the delivery-rate estimator is correctly marked as app-limited, so that
+// low-rate samples from ProbeRTT's reduced cwnd are tagged as app-limited
+// and filtered by updateMaxBw() (spec §5.5.5).
+func TestBBRv3ProbeRTTSamplesMarkedAppLimited(t *testing.T) {
+	s := newTestBBRSender()
+	rtt := 50 * time.Millisecond
+
+	s.driveToState(bbrProbeBW, rtt)
+
+	// Force ProbeRTT.
+	s.sender.minRttStamp = s.clock.Now().Add(-11 * time.Second)
+	s.sender.probeRttMinStamp = s.clock.Now().Add(-6 * time.Second)
+
+	s.sendNPackets(1)
+	s.clock.Advance(200 * time.Millisecond)
+	s.ackNPackets(1, 200*time.Millisecond)
+	require.Equal(t, bbrProbeRTT, s.sender.Mode())
+
+	// The estimator should be marked app-limited during ProbeRTT.
+	require.True(t, s.estimator.IsAppLimited(),
+		"delivery rate estimator should be app-limited during ProbeRTT")
+
+	// Send a packet WHILE in ProbeRTT — it should be stamped as app-limited.
+	if s.sender.CanSend(s.bytesInFlight) {
+		pn := s.packetNumber
+		s.sendPacket()
+		snap, ok := s.pktStates[pn]
+		require.True(t, ok)
+		require.True(t, snap.state.IsAppLimited,
+			"packet sent during ProbeRTT should be marked app-limited")
+	}
+}
+
+// TestBBRv3StartupHighLossRequires6LossEvents verifies that the Startup
+// loss-based exit now requires at least 6 discontiguous loss events
+// (BBRStartupFullLossCnt=6) per spec §5.3.1.3, not just a boolean flag.
+func TestBBRv3StartupHighLossRequires6LossEvents(t *testing.T) {
+	s := newTestBBRSender()
+	rtt := 50 * time.Millisecond
+
+	// Build up some delivered bytes and round history.
+	s.sendNPackets(10)
+	s.clock.Advance(rtt)
+	s.rttStats.UpdateRTT(rtt, 0)
+	s.ackNPackets(10, rtt)
+	require.Equal(t, bbrStartup, s.sender.Mode())
+
+	// Send a flight to have something in-flight.
+	s.sendNPackets(20)
+	s.clock.Advance(rtt)
+
+	// Lose 5 packets (below the threshold of 6).
+	// Each loseNPackets(1) call creates one loss event.
+	for i := 0; i < 5; i++ {
+		s.loseNPackets(1)
+	}
+	require.Equal(t, bbrStartup, s.sender.Mode(),
+		"5 loss events should NOT exit Startup (need 6)")
+	// Check loss tracking BEFORE any ack that might reset the round counters.
+	require.Equal(t, 5, s.sender.lossEventsInRound,
+		"lossEventsInRound should count 5 loss events")
+
+	// Lose 1 more → total 6 loss events in this round.
+	s.loseNPackets(1)
+	require.Equal(t, 6, s.sender.lossEventsInRound,
+		"lossEventsInRound should count each loss event")
+	require.True(t, s.sender.lossInRound)
+}
+
+// TestBBRv3IsExcessiveLossRoundUsesLossRate verifies that isExcessiveLossRound()
+// now computes a proper loss rate rather than just a boolean flag.
+func TestBBRv3IsExcessiveLossRoundUsesLossRate(t *testing.T) {
+	s := newTestBBRSender()
+	rtt := 50 * time.Millisecond
+
+	// Establish baseline.
+	s.sendNPackets(10)
+	s.clock.Advance(rtt)
+	s.rttStats.UpdateRTT(rtt, 0)
+	s.ackNPackets(10, rtt)
+
+	// New round: send a flight.
+	s.sendNPackets(100)
+	s.clock.Advance(rtt)
+	s.ackNPackets(98, rtt) // 98 acked = delivered
+	s.loseNPackets(1)      // 1 lost out of ~99 at risk = ~1% < 2%
+
+	require.True(t, s.sender.lossInRound, "lossInRound should be true")
+	require.False(t, s.sender.isExcessiveLossRound(),
+		"1% loss rate should NOT be excessive (threshold is 2%)")
+
+	// Now create a scenario with >2% loss.
+	// Reset round.
+	s.sender.bytesLostInRound = 0
+	s.sender.lossEventsInRound = 0
+	s.sender.deliveredAtRoundStart = s.sender.lastDelivered
+
+	s.sendNPackets(50)
+	s.clock.Advance(rtt)
+	s.ackNPackets(45, rtt) // 45 acked
+	s.loseNPackets(5)      // 5 lost out of 50 = 10% > 2%
+
+	require.True(t, s.sender.isExcessiveLossRound(),
+		"10% loss rate should be excessive")
 }

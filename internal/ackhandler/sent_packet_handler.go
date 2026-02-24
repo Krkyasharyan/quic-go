@@ -162,6 +162,12 @@ func NewSentPacketHandler(
 		h.enableECN = true
 		h.ecnTracker = newECNTracker(logger, qlogger)
 	}
+	// If the congestion controller supports app-limited marking (e.g. BBRv3),
+	// inject the delivery-rate estimator so it can call MarkConnectionAppLimited()
+	// during ProbeRTT (spec §5.3.4.3).
+	if ala, ok := cc.(congestion.AppLimitedAware); ok {
+		ala.SetAppLimitedSetter(h.deliveryEstimator)
+	}
 	return h
 }
 

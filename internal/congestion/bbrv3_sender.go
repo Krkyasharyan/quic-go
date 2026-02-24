@@ -231,6 +231,8 @@ type bbrv3Sender struct {
 	lossRoundDelivered protocol.ByteCount // C.delivered at start of current loss round
 	lossRoundStart     bool               // true when loss round boundary crosses
 	lossInRound        bool               // whether any loss occurred in the current round
+	bytesLostInRound   protocol.ByteCount // bytes lost in current round (for loss rate)
+	lossEventsInRound  int                // discontiguous loss events in current round (spec §5.3.1.3)
 
 	// --- RTT Estimation ---
 	minRtt           time.Duration // windowed min RTT (spec §5.5.7)
@@ -301,6 +303,9 @@ type bbrv3Sender struct {
 
 	// --- Debug logging ---
 	lastLogTime time.Time
+
+	// --- App-limited setter for ProbeRTT (spec §5.3.4.3) ---
+	appLimitedSetter AppLimitedSetter
 }
 
 var (
@@ -308,7 +313,14 @@ var (
 	_ SendAlgorithmWithDebugInfos = &bbrv3Sender{}
 	_ BandwidthSampleConsumer     = &bbrv3Sender{}
 	_ ECNCongestionConsumer       = &bbrv3Sender{}
+	_ AppLimitedAware             = &bbrv3Sender{}
 )
+
+// SetAppLimitedSetter injects the delivery-rate estimator's app-limited flag.
+// Called by the sent_packet_handler after creating the congestion controller.
+func (b *bbrv3Sender) SetAppLimitedSetter(setter AppLimitedSetter) {
+	b.appLimitedSetter = setter
+}
 
 // NewBBRv3Sender creates a new BBRv3 congestion controller.
 func NewBBRv3Sender(
@@ -446,7 +458,7 @@ func (b *bbrv3Sender) OnPacketAcked(
 		b.checkDrain(priorInFlight)
 	case bbrProbeBW:
 		b.updateProbeBWPhase(eventTime, priorInFlight)
-		b.checkProbeRTT(eventTime)
+		b.checkProbeRTT(eventTime, priorInFlight)
 	case bbrProbeRTT:
 		b.handleProbeRTT(eventTime, priorInFlight)
 	}
@@ -632,9 +644,12 @@ func (b *bbrv3Sender) OnBandwidthSample(sample RateSample) {
 
 		// Per-round delivered tracking (for isExcessiveLossRound denominator).
 		b.deliveredAtRoundStart = b.lastDelivered
+		// Reset per-round loss counters for the NEW round.
 		// NOTE: lossInRound is NOT reset here; it is reset in the
 		// lossRoundStart block below, after adaptLowerBoundsFromCongestion
 		// has had a chance to observe it (spec §5.5.10.3).
+		b.bytesLostInRound = 0
+		b.lossEventsInRound = 0
 	}
 
 	// --- Update congestion signals (spec §5.5.10.3 BBRUpdateCongestionSignals) ---
@@ -697,9 +712,15 @@ func (b *bbrv3Sender) adaptLongTermModel(sample RateSample) {
 	}
 	if b.ackPhase == acksProbeStopping && b.newRoundSinceLastBwSample {
 		// End of samples from bw probing phase.
+		// Advance the max_bw filter once per ProbeBW cycle (spec §5.5.6:
+		// "BBR.cycle_count only needs to be tracked with a single bit").
+		// Transition ackPhase out of acksProbeStopping so the filter is
+		// only advanced ONCE per cycle, preventing premature expiry of
+		// high-bandwidth samples in the windowed max filter.
 		if b.isInAProbeBWState() && !sample.IsAppLimited {
 			b.advanceMaxBwFilter()
 		}
+		b.ackPhase = acksInit
 	}
 
 	if !b.isInflightTooHigh(sample) {
@@ -803,11 +824,13 @@ func (b *bbrv3Sender) startRound() {
 
 // noteLoss records a loss in the current round. Spec §5.5.10 BBRNoteLoss.
 func (b *bbrv3Sender) noteLoss(lostBytes protocol.ByteCount) {
-	_ = lostBytes
 	if !b.lossInRound {
 		b.lossRoundDelivered = b.lastDelivered
 	}
 	b.lossInRound = true
+	b.bytesLostInRound += lostBytes
+	// Each call to noteLoss represents a discontiguous loss event (one packet).
+	b.lossEventsInRound++
 }
 
 // isInflightTooHigh: spec §5.5.10.2 IsInflightTooHigh.
@@ -819,16 +842,26 @@ func (b *bbrv3Sender) isInflightTooHigh(sample RateSample) bool {
 	return sample.PacketLost > protocol.ByteCount(float64(sample.TxInFlight)*bbrLossThreshold)
 }
 
-// isExcessiveLossRound returns true if loss occurred in the current round.
-// This is a simplified per-round check (used for UP exit, Startup exit).
+// isExcessiveLossRound returns true if the loss rate in the current round
+// exceeds BBR.LossThresh (2%). Spec §5.3.1.3 / §5.5.10.2.
 func (b *bbrv3Sender) isExcessiveLossRound() bool {
+	if !b.lossInRound {
+		return false
+	}
 	var deliveredInRound protocol.ByteCount
 	if b.lastDelivered > b.deliveredAtRoundStart {
 		deliveredInRound = b.lastDelivered - b.deliveredAtRoundStart
 	}
-	// We don't have bytes-lost-in-round directly anymore, so use lossInRound flag.
-	// For precise check, we'd need per-round byte counters. Use the flag + round tracking.
-	return b.lossInRound && deliveredInRound > 0
+	if deliveredInRound == 0 {
+		return false
+	}
+	// Total bytes at risk this round = delivered + lost.
+	totalInRound := deliveredInRound + b.bytesLostInRound
+	if totalInRound == 0 {
+		return false
+	}
+	lossRate := float64(b.bytesLostInRound) / float64(totalInRound)
+	return lossRate > bbrLossThreshold
 }
 
 // handleInflightTooHigh: spec §5.5.10.2 BBRHandleInflightTooHigh.
@@ -932,6 +965,8 @@ func (b *bbrv3Sender) lossLowerBounds() {
 // resetCongestionSignals: spec §5.5.10.3 BBRResetCongestionSignals.
 func (b *bbrv3Sender) resetCongestionSignals() {
 	b.lossInRound = false
+	b.bytesLostInRound = 0
+	b.lossEventsInRound = 0
 	b.bwLatest = 0
 	b.inflightLatest = 0
 }
@@ -973,16 +1008,20 @@ func (b *bbrv3Sender) checkFullBWReached(sample RateSample) {
 }
 
 // checkStartupHighLoss: spec §5.3.1.3 BBRCheckStartupHighLoss.
-// Simplified: checks loss rate > 2% and exits Startup.
+// Requires: (a) loss in this round, (b) loss rate > LossThresh (2%),
+// (c) at least BBRStartupFullLossCnt (6) discontiguous loss events.
 func (b *bbrv3Sender) checkStartupHighLoss(sample RateSample) {
 	if b.mode != bbrStartup {
 		return
 	}
-	// Check if in recovery for at least one round + loss rate > threshold.
 	if !b.lossInRound {
 		return
 	}
 	if !b.isExcessiveLossRound() {
+		return
+	}
+	// Spec §5.3.1.3: require at least 6 discontiguous loss ranges.
+	if b.lossEventsInRound < bbrStartupFullLossCnt {
 		return
 	}
 	// Set full_bw_reached and compute safe inflight_longterm.
@@ -1272,7 +1311,7 @@ func (b *bbrv3Sender) probeInflightLongtermUpward(ackedBytes protocol.ByteCount,
 // --- ProbeRTT (spec §5.3.4) ---
 
 // checkProbeRTT: spec §5.3.4.3 BBRCheckProbeRTT.
-func (b *bbrv3Sender) checkProbeRTT(eventTime monotime.Time) {
+func (b *bbrv3Sender) checkProbeRTT(eventTime monotime.Time, bytesInFlight protocol.ByteCount) {
 	if b.disableProbeRTT {
 		return
 	}
@@ -1284,7 +1323,7 @@ func (b *bbrv3Sender) checkProbeRTT(eventTime monotime.Time) {
 		b.startRound()
 	}
 	if b.mode == bbrProbeRTT {
-		b.handleProbeRTT(eventTime, 0) // bytesInFlight handled inside
+		b.handleProbeRTT(eventTime, bytesInFlight)
 	}
 	if b.lastDelivered > b.deliveredAtRoundStart { // RS.delivered > 0
 		b.idleRestart = false
@@ -1301,7 +1340,14 @@ func (b *bbrv3Sender) enterProbeRTT() {
 }
 
 func (b *bbrv3Sender) handleProbeRTT(eventTime monotime.Time, bytesInFlight protocol.ByteCount) {
-	// Spec: MarkConnectionAppLimited() - ignored for now as estimator is separate.
+	// Spec §5.3.4.3: MarkConnectionAppLimited()
+	// Ignore low rate samples during ProbeRTT by marking the connection as
+	// app-limited. This prevents the artificially low delivery rates (caused
+	// by the reduced ProbeRTT cwnd) from being treated as bottleneck
+	// measurements and poisoning the maxBw filter.
+	if b.appLimitedSetter != nil {
+		b.appLimitedSetter.SetAppLimited(true)
+	}
 	// Spec: maintain cwnd at ProbeRTTCwnd.
 	probeRTTCwnd := b.probeRTTCwnd()
 	if b.congestionWindow > probeRTTCwnd {
@@ -1351,6 +1397,12 @@ func (b *bbrv3Sender) checkProbeRTTDone(eventTime monotime.Time) {
 // exitProbeRTT: spec §5.3.4.4 BBRExitProbeRTT.
 func (b *bbrv3Sender) exitProbeRTT() {
 	b.resetShortTermModel()
+	// Clear the app-limited mark set during ProbeRTT so that subsequent
+	// packets are correctly tagged as non-app-limited and can contribute
+	// to the maxBw filter for bandwidth recovery.
+	if b.appLimitedSetter != nil {
+		b.appLimitedSetter.SetAppLimited(false)
+	}
 	if b.fullBwReached {
 		b.startProbeBWDown()
 		b.startProbeBWCruise() // optimization: skip directly to CRUISE

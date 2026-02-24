@@ -43,6 +43,21 @@ type BandwidthSampleConsumer interface {
 	OnBandwidthSample(sample RateSample)
 }
 
+// AppLimitedSetter allows a congestion controller to mark the connection as
+// application-limited. This is used by BBRv3 during ProbeRTT (spec §5.3.4.3)
+// to ensure that low-rate samples produced while cwnd is artificially reduced
+// are correctly tagged, preventing them from polluting the maxBw filter.
+type AppLimitedSetter interface {
+	SetAppLimited(limited bool)
+}
+
+// AppLimitedAware is optionally implemented by congestion controllers (e.g.
+// BBRv3) that need a reference to the AppLimitedSetter so they can call
+// MarkConnectionAppLimited() during ProbeRTT as required by the spec.
+type AppLimitedAware interface {
+	SetAppLimitedSetter(setter AppLimitedSetter)
+}
+
 // DeliveryRateEstimator tracks the connection-level state needed to produce
 // per-ACK delivery rate samples according to the BBR delivery-rate estimation
 // algorithm (draft-cheng-iccrg-delivery-rate-estimation).
