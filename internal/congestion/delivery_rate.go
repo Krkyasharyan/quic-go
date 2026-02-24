@@ -70,10 +70,27 @@ type DeliveryRateEstimator struct {
 	// firstSentTime is the send time of the first packet in the current
 	// flight (reset when bytesInFlight transitions from 0 to >0).
 	firstSentTime monotime.Time
-	// appLimited is true when the sender doesn't have enough data to fill
-	// the congestion window, meaning bandwidth samples during this period
-	// may underestimate the true bottleneck capacity.
-	appLimited bool
+
+	// --- Watermark-based app-limited detection ---
+	// Per draft-cheng-iccrg-delivery-rate-estimation §4.1.1.2 and Linux BBR's
+	// tp->app_limited: when the send loop runs out of data, we record a
+	// watermark = delivered + bytes_in_flight. Once delivered exceeds the
+	// watermark (~1 RTT after sending resumes), the flag auto-clears. This
+	// prevents relay/proxy scenarios from being permanently app-limited
+	// (which happens with a sticky boolean when the cwnd is never filled).
+	appLimitedUntil protocol.ByteCount
+
+	// forceAppLimited is set by the congestion controller (e.g. BBRv3 during
+	// ProbeRTT) to unconditionally mark packets as app-limited. Unlike the
+	// watermark, it does not auto-clear — the controller must explicitly
+	// call SetAppLimited(false).
+	forceAppLimited bool
+
+	// lastSentAppLimited tracks whether the previous OnPacketSent call saw
+	// the connection as app-limited. Used to detect the transition from
+	// app-limited → non-app-limited so we can reset firstSentTime, giving
+	// fresh delivery rate samples uncontaminated by the app-limited gap.
+	lastSentAppLimited bool
 }
 
 // NewDeliveryRateEstimator creates a new estimator with zero state.
@@ -87,7 +104,6 @@ func NewDeliveryRateEstimator() *DeliveryRateEstimator {
 //
 // sentTime is the packet's send timestamp (monotime).
 // bytesInFlight is the number of bytes in flight *before* this packet is added.
-// appLimited indicates whether the sender was application-limited at send time.
 func (e *DeliveryRateEstimator) OnPacketSent(
 	sentTime monotime.Time,
 	bytesInFlight protocol.ByteCount,
@@ -99,11 +115,24 @@ func (e *DeliveryRateEstimator) OnPacketSent(
 		e.deliveredTime = sentTime
 	}
 
+	isAppLimited := e.forceAppLimited || e.appLimitedUntil > 0
+
+	// When transitioning from app-limited to non-app-limited while there
+	// are still packets in flight, reset the send baseline. This ensures
+	// delivery rate samples after the transition aren't contaminated by
+	// the inflated sendElapsed that includes the app-limited gap. This is
+	// critical for proxy/relay scenarios where bytesInFlight rarely
+	// reaches 0 and firstSentTime would otherwise never refresh.
+	if !isAppLimited && e.lastSentAppLimited && bytesInFlight > 0 {
+		e.firstSentTime = sentTime
+	}
+	e.lastSentAppLimited = isAppLimited
+
 	return PacketDeliveryState{
 		Delivered:     e.delivered,
 		DeliveredTime: e.deliveredTime,
 		FirstSentTime: e.firstSentTime,
-		IsAppLimited:  e.appLimited,
+		IsAppLimited:  isAppLimited,
 	}
 }
 
@@ -123,6 +152,13 @@ func (e *DeliveryRateEstimator) GenerateRateSample(
 	// Update connection-level counters.
 	e.delivered += ackedBytes
 	e.deliveredTime = now
+
+	// Auto-clear the app-limited watermark once enough bytes have been
+	// delivered past the mark, per draft-cheng-iccrg-delivery-rate-estimation
+	// §4.1.2.5. This indicates the pipe has "refilled" with non-app-limited data.
+	if e.appLimitedUntil > 0 && e.delivered > e.appLimitedUntil {
+		e.appLimitedUntil = 0
+	}
 
 	// Compute elapsed intervals.
 	sendElapsed := pktSendTime.Sub(pktState.FirstSentTime)
@@ -162,14 +198,41 @@ func (e *DeliveryRateEstimator) GenerateRateSample(
 	}
 }
 
-// SetAppLimited marks the connection as application-limited (or not).
+// SetAppLimited is used by congestion controllers to force the app-limited
+// state (e.g., BBRv3 during ProbeRTT per spec §5.3.4.3). Unlike the
+// watermark set by MarkAppLimited, this flag does not auto-clear — the
+// controller must explicitly call SetAppLimited(false).
 func (e *DeliveryRateEstimator) SetAppLimited(limited bool) {
-	e.appLimited = limited
+	e.forceAppLimited = limited
 }
 
-// IsAppLimited reports whether the connection is currently app-limited.
+// MarkAppLimited sets the app-limited watermark per
+// draft-cheng-iccrg-delivery-rate-estimation §4.1.1.2:
+//
+//	C.app_limited = (C.delivered + bytes_in_flight) ?: 1
+//
+// Called by the send loop when the sender runs out of data to send while
+// the congestion window is not full. The watermark auto-clears in
+// GenerateRateSample when delivered exceeds it (~1 RTT after sending
+// resumes), unlike the sticky boolean this replaces.
+func (e *DeliveryRateEstimator) MarkAppLimited(bytesInFlight protocol.ByteCount) {
+	e.appLimitedUntil = e.delivered + bytesInFlight
+	if e.appLimitedUntil == 0 {
+		e.appLimitedUntil = 1 // ensure non-zero to indicate app-limited
+	}
+}
+
+// ClearAppLimitedWatermark immediately clears the send-loop watermark.
+// Called when the pipe fills (bytesInFlight >= cwnd), providing faster
+// clearing than waiting for the ACK-path auto-clear.
+func (e *DeliveryRateEstimator) ClearAppLimitedWatermark() {
+	e.appLimitedUntil = 0
+}
+
+// IsAppLimited reports whether the connection is currently app-limited,
+// either via the send-loop watermark or the CC-forced flag.
 func (e *DeliveryRateEstimator) IsAppLimited() bool {
-	return e.appLimited
+	return e.forceAppLimited || e.appLimitedUntil > 0
 }
 
 // Delivered returns the current cumulative delivered byte count.
