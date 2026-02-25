@@ -68,7 +68,7 @@ func (s *testBBRSender) sendPacket() {
 	// Snapshot delivery state before send (mirrors sent_packet_handler).
 	// Clear app-limited once pipe fills (matches production code).
 	if s.bytesInFlight >= s.sender.GetCongestionWindow() {
-		s.estimator.ClearAppLimitedWatermark()
+		s.estimator.ClearAppLimited()
 	}
 	ds := s.estimator.OnPacketSent(s.clock.Now(), s.bytesInFlight)
 	s.pktStates[s.packetNumber] = pktSnapshot{state: ds, sendTime: s.clock.Now()}
@@ -86,17 +86,14 @@ func (s *testBBRSender) sendNPackets(n int) {
 
 // sendAppLimitedPacket sends a packet while the connection is explicitly
 // marked as app-limited (simulating MarkAppLimited() from the send loop).
-// Uses SetAppLimited(true) (force flag) so the packet is guaranteed
-// app-limited regardless of watermark state.
 func (s *testBBRSender) sendAppLimitedPacket() {
-	s.estimator.SetAppLimited(true)
+	s.estimator.MarkAppLimited(s.bytesInFlight)
 	ds := s.estimator.OnPacketSent(s.clock.Now(), s.bytesInFlight)
 	s.pktStates[s.packetNumber] = pktSnapshot{state: ds, sendTime: s.clock.Now()}
 
 	s.sender.OnPacketSent(s.clock.Now(), s.bytesInFlight, s.packetNumber, bbrTestMaxDatagramSize, true)
 	s.bytesInFlight += bbrTestMaxDatagramSize
 	s.packetNumber++
-	s.estimator.SetAppLimited(false) // clear force flag; watermark (if any) stays
 }
 
 func (s *testBBRSender) ackNPackets(n int, rtt time.Duration) {

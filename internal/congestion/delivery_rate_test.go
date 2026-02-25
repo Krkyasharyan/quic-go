@@ -114,8 +114,8 @@ func TestDeliveryRateEstimatorAppLimited(t *testing.T) {
 
 	var now monotime.Time = 1_000_000_000
 
-	// Mark as app-limited, then send a packet.
-	e.SetAppLimited(true)
+	// Mark as app-limited using watermark, then send a packet.
+	e.MarkAppLimited(0) // no inflight → watermark = max(delivered + 0, 1) = 1
 	state := e.OnPacketSent(now, 0)
 	require.True(t, state.IsAppLimited, "snapshot should record app-limited state")
 
@@ -125,7 +125,7 @@ func TestDeliveryRateEstimatorAppLimited(t *testing.T) {
 	require.True(t, sample.IsAppLimited, "sample should be marked as app-limited")
 
 	// Clear app-limited, send a packet when NOT app-limited.
-	e.SetAppLimited(false)
+	e.ClearAppLimited()
 	now = ackTime
 	state2 := e.OnPacketSent(now, testPacketSize)
 	require.False(t, state2.IsAppLimited, "should not be app-limited")

@@ -8,6 +8,8 @@ mockgen_tmp.go
 *.txt
 race.[0-9]*
 
+.vscode/*.md
+
 fuzzing/*/*.zip
 fuzzing/*/coverprofile
 fuzzing/*/crashers

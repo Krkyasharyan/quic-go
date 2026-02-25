@@ -1346,7 +1346,7 @@ func (b *bbrv3Sender) handleProbeRTT(eventTime monotime.Time, bytesInFlight prot
 	// by the reduced ProbeRTT cwnd) from being treated as bottleneck
 	// measurements and poisoning the maxBw filter.
 	if b.appLimitedSetter != nil {
-		b.appLimitedSetter.SetAppLimited(true)
+		b.appLimitedSetter.MarkAppLimited(bytesInFlight)
 	}
 	// Spec: maintain cwnd at ProbeRTTCwnd.
 	probeRTTCwnd := b.probeRTTCwnd()
@@ -1401,7 +1401,7 @@ func (b *bbrv3Sender) exitProbeRTT() {
 	// packets are correctly tagged as non-app-limited and can contribute
 	// to the maxBw filter for bandwidth recovery.
 	if b.appLimitedSetter != nil {
-		b.appLimitedSetter.SetAppLimited(false)
+		b.appLimitedSetter.ClearAppLimited()
 	}
 	if b.fullBwReached {
 		b.startProbeBWDown()

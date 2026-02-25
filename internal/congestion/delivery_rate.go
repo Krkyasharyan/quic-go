@@ -44,11 +44,14 @@ type BandwidthSampleConsumer interface {
 }
 
 // AppLimitedSetter allows a congestion controller to mark the connection as
-// application-limited. This is used by BBRv3 during ProbeRTT (spec §5.3.4.3)
-// to ensure that low-rate samples produced while cwnd is artificially reduced
-// are correctly tagged, preventing them from polluting the maxBw filter.
+// application-limited using the watermark approach from spec §4.1.2.4.
+//
+// MarkAppLimited sets C.app_limited = (C.delivered + bytesInFlight) so that
+// the flag auto-clears once the "bubble" of app-limited data flushes through.
+// ClearAppLimited forces C.app_limited = 0 (non-app-limited).
 type AppLimitedSetter interface {
-	SetAppLimited(limited bool)
+	MarkAppLimited(bytesInFlight protocol.ByteCount)
+	ClearAppLimited()
 }
 
 // AppLimitedAware is optionally implemented by congestion controllers (e.g.
@@ -70,27 +73,12 @@ type DeliveryRateEstimator struct {
 	// firstSentTime is the send time of the first packet in the current
 	// flight (reset when bytesInFlight transitions from 0 to >0).
 	firstSentTime monotime.Time
-
-	// --- Watermark-based app-limited detection ---
-	// Per draft-cheng-iccrg-delivery-rate-estimation §4.1.1.2 and Linux BBR's
-	// tp->app_limited: when the send loop runs out of data, we record a
-	// watermark = delivered + bytes_in_flight. Once delivered exceeds the
-	// watermark (~1 RTT after sending resumes), the flag auto-clears. This
-	// prevents relay/proxy scenarios from being permanently app-limited
-	// (which happens with a sticky boolean when the cwnd is never filled).
-	appLimitedUntil protocol.ByteCount
-
-	// forceAppLimited is set by the congestion controller (e.g. BBRv3 during
-	// ProbeRTT) to unconditionally mark packets as app-limited. Unlike the
-	// watermark, it does not auto-clear — the controller must explicitly
-	// call SetAppLimited(false).
-	forceAppLimited bool
-
-	// lastSentAppLimited tracks whether the previous OnPacketSent call saw
-	// the connection as app-limited. Used to detect the transition from
-	// app-limited → non-app-limited so we can reset firstSentTime, giving
-	// fresh delivery rate samples uncontaminated by the app-limited gap.
-	lastSentAppLimited bool
+	// appLimited is the delivery-count watermark per spec §4.1.2.4:
+	//   C.app_limited = (C.delivered + C.inflight) when marked, or 0.
+	// A non-zero value means the connection is app-limited. The flag
+	// auto-clears in GenerateRateSample once C.delivered > C.app_limited,
+	// i.e. the "bubble" of app-limited data has been ACKed and flushed.
+	appLimited protocol.ByteCount
 }
 
 // NewDeliveryRateEstimator creates a new estimator with zero state.
@@ -104,6 +92,7 @@ func NewDeliveryRateEstimator() *DeliveryRateEstimator {
 //
 // sentTime is the packet's send timestamp (monotime).
 // bytesInFlight is the number of bytes in flight *before* this packet is added.
+// appLimited indicates whether the sender was application-limited at send time.
 func (e *DeliveryRateEstimator) OnPacketSent(
 	sentTime monotime.Time,
 	bytesInFlight protocol.ByteCount,
@@ -115,24 +104,11 @@ func (e *DeliveryRateEstimator) OnPacketSent(
 		e.deliveredTime = sentTime
 	}
 
-	isAppLimited := e.forceAppLimited || e.appLimitedUntil > 0
-
-	// When transitioning from app-limited to non-app-limited while there
-	// are still packets in flight, reset the send baseline. This ensures
-	// delivery rate samples after the transition aren't contaminated by
-	// the inflated sendElapsed that includes the app-limited gap. This is
-	// critical for proxy/relay scenarios where bytesInFlight rarely
-	// reaches 0 and firstSentTime would otherwise never refresh.
-	if !isAppLimited && e.lastSentAppLimited && bytesInFlight > 0 {
-		e.firstSentTime = sentTime
-	}
-	e.lastSentAppLimited = isAppLimited
-
 	return PacketDeliveryState{
 		Delivered:     e.delivered,
 		DeliveredTime: e.deliveredTime,
 		FirstSentTime: e.firstSentTime,
-		IsAppLimited:  isAppLimited,
+		IsAppLimited:  e.appLimited != 0,
 	}
 }
 
@@ -153,11 +129,12 @@ func (e *DeliveryRateEstimator) GenerateRateSample(
 	e.delivered += ackedBytes
 	e.deliveredTime = now
 
-	// Auto-clear the app-limited watermark once enough bytes have been
-	// delivered past the mark, per draft-cheng-iccrg-delivery-rate-estimation
-	// §4.1.2.5. This indicates the pipe has "refilled" with non-app-limited data.
-	if e.appLimitedUntil > 0 && e.delivered > e.appLimitedUntil {
-		e.appLimitedUntil = 0
+	// Spec §4.1.2.3 GenerateRateSample():
+	//   "Clear app-limited field if bubble is ACKed and gone."
+	//   if (C.app_limited and C.delivered > C.app_limited)
+	//     C.app_limited = 0
+	if e.appLimited != 0 && e.delivered > e.appLimited {
+		e.appLimited = 0
 	}
 
 	// Compute elapsed intervals.
@@ -198,41 +175,29 @@ func (e *DeliveryRateEstimator) GenerateRateSample(
 	}
 }
 
-// SetAppLimited is used by congestion controllers to force the app-limited
-// state (e.g., BBRv3 during ProbeRTT per spec §5.3.4.3). Unlike the
-// watermark set by MarkAppLimited, this flag does not auto-clear — the
-// controller must explicitly call SetAppLimited(false).
-func (e *DeliveryRateEstimator) SetAppLimited(limited bool) {
-	e.forceAppLimited = limited
-}
-
-// MarkAppLimited sets the app-limited watermark per
-// draft-cheng-iccrg-delivery-rate-estimation §4.1.1.2:
+// MarkAppLimited sets the delivery-count watermark per spec §4.1.2.4:
 //
-//	C.app_limited = (C.delivered + bytes_in_flight) ?: 1
+//	C.app_limited = (C.delivered + C.inflight) ? : 1
 //
-// Called by the send loop when the sender runs out of data to send while
-// the congestion window is not full. The watermark auto-clears in
-// GenerateRateSample when delivered exceeds it (~1 RTT after sending
-// resumes), unlike the sticky boolean this replaces.
+// The watermark auto-clears in GenerateRateSample once C.delivered exceeds
+// it, meaning all data that was in flight when app-limited was set has been
+// delivered and the "bubble" has flushed.
 func (e *DeliveryRateEstimator) MarkAppLimited(bytesInFlight protocol.ByteCount) {
-	e.appLimitedUntil = e.delivered + bytesInFlight
-	if e.appLimitedUntil == 0 {
-		e.appLimitedUntil = 1 // ensure non-zero to indicate app-limited
+	wm := e.delivered + protocol.ByteCount(bytesInFlight)
+	if wm == 0 {
+		wm = 1
 	}
+	e.appLimited = wm
 }
 
-// ClearAppLimitedWatermark immediately clears the send-loop watermark.
-// Called when the pipe fills (bytesInFlight >= cwnd), providing faster
-// clearing than waiting for the ACK-path auto-clear.
-func (e *DeliveryRateEstimator) ClearAppLimitedWatermark() {
-	e.appLimitedUntil = 0
+// ClearAppLimited forces the connection out of app-limited state.
+func (e *DeliveryRateEstimator) ClearAppLimited() {
+	e.appLimited = 0
 }
 
-// IsAppLimited reports whether the connection is currently app-limited,
-// either via the send-loop watermark or the CC-forced flag.
+// IsAppLimited reports whether the connection is currently app-limited.
 func (e *DeliveryRateEstimator) IsAppLimited() bool {
-	return e.forceAppLimited || e.appLimitedUntil > 0
+	return e.appLimited != 0
 }
 
 // Delivered returns the current cumulative delivered byte count.

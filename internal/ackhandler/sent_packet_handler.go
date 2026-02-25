@@ -313,12 +313,12 @@ func (h *sentPacketHandler) SentPacket(
 	// bytesInFlight here reflects the state *before* this packet (we want to
 	// detect a new flight when nothing was in flight before this send).
 	//
-	// App-limited detection uses a watermark set by MarkAppLimited()
+	// App-limited detection uses the persistent watermark set by MarkAppLimited()
 	// (called from the send loop when there's no data to send with pipe not
-	// full). The watermark auto-clears in the ACK path when enough bytes are
-	// delivered. We also clear it here when the pipe fills for faster clearing.
+	// full). Clear the flag once the pipe fills — belt-and-suspenders with
+	// the auto-clearing watermark in GenerateRateSample (spec §4.1.2.3).
 	if isAckEliciting && h.bytesInFlight >= h.congestion.GetCongestionWindow() {
-		h.deliveryEstimator.ClearAppLimitedWatermark()
+		h.deliveryEstimator.ClearAppLimited()
 	}
 	// Compute prior bytes-in-flight: the state *before* this packet was added.
 	// For ack-eliciting packets, bytesInFlight was already incremented above,
@@ -1106,9 +1106,9 @@ func (h *sentPacketHandler) SetMaxDatagramSize(s protocol.ByteCount) {
 }
 
 // MarkAppLimited is called when the send loop runs out of data to send
-// while the congestion window is not full. Sets a delivered-count watermark
-// on the delivery rate estimator that auto-clears after ~1 RTT of delivery,
-// per draft-cheng-iccrg-delivery-rate-estimation §4.1.1.2.
+// while the congestion window is not full. Sets the delivery-rate estimator's
+// watermark to (delivered + bytesInFlight) per spec §4.1.2.4, so that the
+// app-limited flag auto-clears once the bubble of in-flight data is delivered.
 func (h *sentPacketHandler) MarkAppLimited() {
 	if h.bytesInFlight < h.congestion.GetCongestionWindow() {
 		h.deliveryEstimator.MarkAppLimited(h.bytesInFlight)
