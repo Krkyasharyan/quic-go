@@ -98,23 +98,18 @@ func (s *testBBRSender) sendAppLimitedPacket() {
 
 func (s *testBBRSender) ackNPackets(n int, rtt time.Duration) {
 	s.rttStats.UpdateRTT(rtt, 0)
-	var bestSample RateSample
+
+	// Phase 1: InitRateSample (spec §4.1.2.3)
+	s.estimator.InitRateSample()
+
+	// Phase 2: UpdateRateSample + OnPacketAcked per-packet
 	for range n {
 		s.ackedPacketNumber++
 
-		// Generate delivery-rate sample (mirrors sent_packet_handler ACK path).
 		if snap, ok := s.pktStates[s.ackedPacketNumber]; ok {
-			sample := s.estimator.GenerateRateSample(
+			s.estimator.UpdateRateSample(
 				snap.state, snap.sendTime, bbrTestMaxDatagramSize, s.clock.Now(),
 			)
-			// Best-sample selection: prefer non-app-limited over app-limited.
-			if bestSample.DeliveryRate == 0 {
-				bestSample = sample
-			} else if !sample.IsAppLimited && bestSample.IsAppLimited {
-				bestSample = sample
-			} else if sample.IsAppLimited == bestSample.IsAppLimited && sample.DeliveryRate > bestSample.DeliveryRate {
-				bestSample = sample
-			}
 			delete(s.pktStates, s.ackedPacketNumber)
 		}
 
@@ -128,9 +123,11 @@ func (s *testBBRSender) ackNPackets(n int, rtt time.Duration) {
 			s.bytesInFlight -= bbrTestMaxDatagramSize
 		}
 	}
-	// Feed the best sample to the bandwidth consumer.
-	if bestSample.DeliveryRate > 0 {
-		s.sender.OnBandwidthSample(bestSample)
+
+	// Phase 3: GenerateRateSample + feed to bandwidth consumer
+	sample := s.estimator.GenerateRateSample()
+	if sample.DeliveryRate > 0 {
+		s.sender.OnBandwidthSample(sample)
 	}
 }
 
@@ -956,9 +953,9 @@ func TestBBRv3AppLimitedSampleRejectedWhenBtlBwZero(t *testing.T) {
 	// ACK it — this produces an app-limited sample.
 	s.ackedPacketNumber++
 	snap := s.pktStates[s.ackedPacketNumber]
-	sample := s.estimator.GenerateRateSample(
-		snap.state, snap.sendTime, bbrTestMaxDatagramSize, s.clock.Now(),
-	)
+	s.estimator.InitRateSample()
+	s.estimator.UpdateRateSample(snap.state, snap.sendTime, bbrTestMaxDatagramSize, s.clock.Now())
+	sample := s.estimator.GenerateRateSample()
 	require.True(t, sample.IsAppLimited)
 	require.True(t, sample.DeliveryRate > 0)
 	delete(s.pktStates, s.ackedPacketNumber)
@@ -995,9 +992,9 @@ func TestBBRv3AppLimitedSampleAcceptedWhenExceedsBtlBw(t *testing.T) {
 
 	s.ackedPacketNumber++
 	snap := s.pktStates[s.ackedPacketNumber]
-	sample := s.estimator.GenerateRateSample(
-		snap.state, snap.sendTime, bbrTestMaxDatagramSize, s.clock.Now(),
-	)
+	s.estimator.InitRateSample()
+	s.estimator.UpdateRateSample(snap.state, snap.sendTime, bbrTestMaxDatagramSize, s.clock.Now())
+	sample := s.estimator.GenerateRateSample()
 	require.True(t, sample.IsAppLimited)
 	delete(s.pktStates, s.ackedPacketNumber)
 
@@ -1036,9 +1033,9 @@ func TestBBRv3StartupIgnoresAppLimitedRounds(t *testing.T) {
 		// ACK with app-limited sample only.
 		s.ackedPacketNumber++
 		snap := s.pktStates[s.ackedPacketNumber]
-		sample := s.estimator.GenerateRateSample(
-			snap.state, snap.sendTime, bbrTestMaxDatagramSize, s.clock.Now(),
-		)
+		s.estimator.InitRateSample()
+		s.estimator.UpdateRateSample(snap.state, snap.sendTime, bbrTestMaxDatagramSize, s.clock.Now())
+		sample := s.estimator.GenerateRateSample()
 		delete(s.pktStates, s.ackedPacketNumber)
 		s.sender.OnPacketAcked(s.ackedPacketNumber, bbrTestMaxDatagramSize, s.bytesInFlight, s.clock.Now())
 		s.bytesInFlight -= bbrTestMaxDatagramSize
@@ -1072,9 +1069,9 @@ func TestBBRv3BestSamplePrefersNonAppLimited(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		s.ackedPacketNumber++
 		if snap, ok := s.pktStates[s.ackedPacketNumber]; ok {
-			sample := s.estimator.GenerateRateSample(
-				snap.state, snap.sendTime, bbrTestMaxDatagramSize, s.clock.Now(),
-			)
+			s.estimator.InitRateSample()
+			s.estimator.UpdateRateSample(snap.state, snap.sendTime, bbrTestMaxDatagramSize, s.clock.Now())
+			sample := s.estimator.GenerateRateSample()
 			samples = append(samples, sample)
 			delete(s.pktStates, s.ackedPacketNumber)
 		}
@@ -1124,9 +1121,9 @@ func TestBBRv3NormalOperationAfterAppLimitedPhase(t *testing.T) {
 		s.clock.Advance(rtt)
 		s.ackedPacketNumber++
 		if snap, ok := s.pktStates[s.ackedPacketNumber]; ok {
-			sample := s.estimator.GenerateRateSample(
-				snap.state, snap.sendTime, bbrTestMaxDatagramSize, s.clock.Now(),
-			)
+			s.estimator.InitRateSample()
+			s.estimator.UpdateRateSample(snap.state, snap.sendTime, bbrTestMaxDatagramSize, s.clock.Now())
+			sample := s.estimator.GenerateRateSample()
 			delete(s.pktStates, s.ackedPacketNumber)
 			s.sender.OnPacketAcked(s.ackedPacketNumber, bbrTestMaxDatagramSize, s.bytesInFlight, s.clock.Now())
 			s.bytesInFlight -= bbrTestMaxDatagramSize
@@ -1638,38 +1635,42 @@ func TestBBRv3StartupHighLossRequires6LossEvents(t *testing.T) {
 }
 
 // TestBBRv3IsExcessiveLossRoundUsesLossRate verifies that isExcessiveLossRound()
-// now computes a proper loss rate rather than just a boolean flag.
+// computes a proper loss rate rather than just a boolean flag.
 func TestBBRv3IsExcessiveLossRoundUsesLossRate(t *testing.T) {
 	s := newTestBBRSender()
-	rtt := 50 * time.Millisecond
 
-	// Establish baseline.
-	s.sendNPackets(10)
-	s.clock.Advance(rtt)
-	s.rttStats.UpdateRTT(rtt, 0)
-	s.ackNPackets(10, rtt)
+	// Case 1: no loss in round → not excessive.
+	s.sender.lossInRound = false
+	s.sender.bytesLostInRound = 0
+	s.sender.lastDelivered = 100000
+	s.sender.deliveredAtRoundStart = 0
+	require.False(t, s.sender.isExcessiveLossRound(),
+		"no loss → not excessive")
 
-	// New round: send a flight.
-	s.sendNPackets(100)
-	s.clock.Advance(rtt)
-	s.ackNPackets(98, rtt) // 98 acked = delivered
-	s.loseNPackets(1)      // 1 lost out of ~99 at risk = ~1% < 2%
-
-	require.True(t, s.sender.lossInRound, "lossInRound should be true")
+	// Case 2: 1% loss rate (< 2% threshold) → not excessive.
+	s.sender.lossInRound = true
+	s.sender.lastDelivered = 100000
+	s.sender.deliveredAtRoundStart = 0
+	// 1% of 100000 delivered = 1000 bytes lost; total at risk = 101000
+	s.sender.bytesLostInRound = 1000
 	require.False(t, s.sender.isExcessiveLossRound(),
 		"1% loss rate should NOT be excessive (threshold is 2%)")
 
-	// Now create a scenario with >2% loss.
-	// Reset round.
-	s.sender.bytesLostInRound = 0
-	s.sender.lossEventsInRound = 0
-	s.sender.deliveredAtRoundStart = s.sender.lastDelivered
-
-	s.sendNPackets(50)
-	s.clock.Advance(rtt)
-	s.ackNPackets(45, rtt) // 45 acked
-	s.loseNPackets(5)      // 5 lost out of 50 = 10% > 2%
-
+	// Case 3: 10% loss rate (> 2% threshold) → excessive.
+	s.sender.lossInRound = true
+	s.sender.lastDelivered = 50000
+	s.sender.deliveredAtRoundStart = 0
+	// 10% loss: 5000 lost / (50000 + 5000) total ≈ 9.1%
+	s.sender.bytesLostInRound = 5000
 	require.True(t, s.sender.isExcessiveLossRound(),
 		"10% loss rate should be excessive")
+
+	// Case 4: exactly at threshold (2%) → not excessive (strict >).
+	s.sender.lossInRound = true
+	s.sender.lastDelivered = 98000
+	s.sender.deliveredAtRoundStart = 0
+	// 2% of total: lost=2000, total=100000, rate=0.02 exactly → not > 0.02
+	s.sender.bytesLostInRound = 2000
+	require.False(t, s.sender.isExcessiveLossRound(),
+		"exactly 2% loss rate should NOT be excessive (strict >)")
 }

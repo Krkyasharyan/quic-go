@@ -479,33 +479,30 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 		h.detectLostPathProbes(rcvTime)
 	}
 	var acked1RTTPacket bool
-	var bestSample congestion.RateSample
 	var totalNewlyAcked protocol.ByteCount
+
+	// --- Phase 1: InitRateSample (spec §4.1.2.3) ---
+	h.deliveryEstimator.InitRateSample()
+
+	// --- Phase 2: UpdateRateSample per-packet (spec §4.1.2.3) ---
+	// Also run OnPacketAcked for each packet (BBR state machine + round tracking).
+	// Note: the spec calls for updating the model (updateMaxBw) before
+	// control parameters (setCwnd/setPacingRate). OnPacketAcked runs the state
+	// machine but defers bandwidth model updates to OnBandwidthSample which
+	// is called after this loop.
 	for _, p := range ackedPackets {
 		if p.includedInBytesInFlight {
 			h.congestion.OnPacketAcked(p.PacketNumber, p.Length, priorInFlight, rcvTime)
 			totalNewlyAcked += p.Length
 
-			// Compute a delivery-rate sample for this packet.
+			// Update the delivery-rate sample with this packet (spec §4.1.2.3).
 			pktState := congestion.PacketDeliveryState{
 				Delivered:     p.deliveredAtSend,
 				DeliveredTime: p.deliveredTimeAtSend,
 				FirstSentTime: p.firstSentTimeAtSend,
 				IsAppLimited:  p.isAppLimitedAtSend,
 			}
-			sample := h.deliveryEstimator.GenerateRateSample(pktState, p.SendTime, p.Length, rcvTime)
-			sample.TxInFlight = p.bytesInFlightAtSend
-			sample.PacketSize = p.Length
-			// Prefer non-app-limited samples over app-limited ones.
-			// Among samples of the same limitation status, prefer higher delivery rate.
-			// This prevents app-limited samples from crowding out real bottleneck measurements.
-			if bestSample.DeliveryRate == 0 {
-				bestSample = sample
-			} else if !sample.IsAppLimited && bestSample.IsAppLimited {
-				bestSample = sample
-			} else if sample.IsAppLimited == bestSample.IsAppLimited && sample.DeliveryRate > bestSample.DeliveryRate {
-				bestSample = sample
-			}
+			h.deliveryEstimator.UpdateRateSample(pktState, p.SendTime, p.Length, rcvTime)
 		}
 		if p.EncryptionLevel == protocol.Encryption1RTT {
 			acked1RTTPacket = true
@@ -515,11 +512,17 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 			putPacket(p.packet)
 		}
 	}
-	// Feed the best delivery-rate sample from this ACK to the congestion controller.
-	if bestSample.DeliveryRate > 0 {
-		bestSample.NewlyAcked = totalNewlyAcked
+
+	// --- Phase 3: GenerateRateSample (spec §4.1.2.3) ---
+	// Produces a single rate sample from the reference (newest) packet.
+	rateSample := h.deliveryEstimator.GenerateRateSample()
+
+	// Feed the delivery-rate sample to the congestion controller for
+	// bandwidth model update (spec §5.5 BBRUpdateModelAndState).
+	if rateSample.DeliveryRate > 0 {
+		rateSample.NewlyAcked = totalNewlyAcked
 		if bsc, ok := h.congestion.(congestion.BandwidthSampleConsumer); ok {
-			bsc.OnBandwidthSample(bestSample)
+			bsc.OnBandwidthSample(rateSample)
 		}
 	}
 

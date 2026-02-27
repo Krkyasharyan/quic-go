@@ -63,15 +63,27 @@ type AppLimitedAware interface {
 
 // DeliveryRateEstimator tracks the connection-level state needed to produce
 // per-ACK delivery rate samples according to the BBR delivery-rate estimation
-// algorithm (draft-cheng-iccrg-delivery-rate-estimation).
+// algorithm (draft-cheng-iccrg-delivery-rate-estimation §4.1.2).
+//
+// The estimator follows the spec's 3-phase approach:
+//  1. InitRateSample() — initialize per-ACK state
+//  2. UpdateRateSample() — called per-ACKed-packet, updates C.delivered and
+//     tracks the reference (most recently sent) packet
+//  3. GenerateRateSample() — called once after all packets are processed,
+//     computes the final delivery rate from the reference packet
 type DeliveryRateEstimator struct {
-	// delivered is the cumulative count of bytes acknowledged so far.
+	// delivered is the cumulative count of bytes acknowledged so far (C.delivered).
 	delivered protocol.ByteCount
 	// deliveredTime is the wall-clock (monotime) at which delivered was last
-	// updated.
+	// updated (C.delivered_time).
 	deliveredTime monotime.Time
-	// firstSentTime is the send time of the first packet in the current
-	// flight (reset when bytesInFlight transitions from 0 to >0).
+	// firstSentTime tracks the send time of the reference packet from the
+	// most recently completed ACK processing (C.first_send_time). This is
+	// updated to P.send_time of the newest ACKed packet during
+	// UpdateRateSample, per spec §4.1.2.3. It serves as the anchor for
+	// sendElapsed in the next rate sample, ensuring the send-side interval
+	// stays bounded (typically ~1 RTT) rather than growing unbounded from
+	// connection start.
 	firstSentTime monotime.Time
 	// appLimited is the delivery-count watermark per spec §4.1.2.4:
 	//   C.app_limited = (C.delivered + C.inflight) when marked, or 0.
@@ -79,6 +91,26 @@ type DeliveryRateEstimator struct {
 	// auto-clears in GenerateRateSample once C.delivered > C.app_limited,
 	// i.e. the "bubble" of app-limited data has been ACKed and flushed.
 	appLimited protocol.ByteCount
+
+	// --- Per-ACK accumulation state (spec §4.1.2.3 UpdateRateSample) ---
+	// These fields are set during the per-packet UpdateRateSample calls and
+	// consumed by the final GenerateRateSample call.
+
+	// rsHasData is true if at least one packet has been processed this ACK.
+	rsHasData bool
+	// rsPriorDelivered is P.delivered from the reference packet.
+	rsPriorDelivered protocol.ByteCount
+	// rsPriorTime is P.delivered_time from the reference packet.
+	rsPriorTime monotime.Time
+	// rsIsAppLimited is P.is_app_limited from the reference packet.
+	rsIsAppLimited bool
+	// rsSendElapsed is P.send_time - P.first_send_time from the reference packet.
+	rsSendElapsed time.Duration
+	// rsAckElapsed is C.delivered_time - P.delivered_time from the reference packet.
+	rsAckElapsed time.Duration
+	// rsRefSendTime is the send time of the reference (newest) packet,
+	// used to update C.first_send_time after GenerateRateSample.
+	rsRefSendTime monotime.Time
 }
 
 // NewDeliveryRateEstimator creates a new estimator with zero state.
@@ -92,7 +124,8 @@ func NewDeliveryRateEstimator() *DeliveryRateEstimator {
 //
 // sentTime is the packet's send timestamp (monotime).
 // bytesInFlight is the number of bytes in flight *before* this packet is added.
-// appLimited indicates whether the sender was application-limited at send time.
+//
+// Spec §4.1.2.2 OnPacketSent.
 func (e *DeliveryRateEstimator) OnPacketSent(
 	sentTime monotime.Time,
 	bytesInFlight protocol.ByteCount,
@@ -112,66 +145,108 @@ func (e *DeliveryRateEstimator) OnPacketSent(
 	}
 }
 
-// GenerateRateSample computes a delivery rate sample when a packet is
-// acknowledged. It updates the connection-level delivered counter.
+// InitRateSample initializes per-ACK state before processing individual
+// packet acknowledgements. Must be called once at the start of each ACK event.
+//
+// Spec §4.1.2.3 InitRateSample.
+func (e *DeliveryRateEstimator) InitRateSample() {
+	e.rsHasData = false
+	e.rsPriorDelivered = 0
+	e.rsPriorTime = 0
+	e.rsIsAppLimited = false
+	e.rsSendElapsed = 0
+	e.rsAckElapsed = 0
+	e.rsRefSendTime = 0
+}
+
+// UpdateRateSample is called for each newly acknowledged packet. It updates
+// the connection-level delivered counter and tracks the reference packet
+// (the most recently sent packet in this ACK) for rate computation.
 //
 // pktState is the delivery snapshot stored on the packet at send time.
 // pktSendTime is the packet's original send timestamp.
 // ackedBytes is the wire size of the acknowledged packet.
 // now is the current time (ACK receipt time).
-func (e *DeliveryRateEstimator) GenerateRateSample(
+//
+// Spec §4.1.2.3 UpdateRateSample.
+func (e *DeliveryRateEstimator) UpdateRateSample(
 	pktState PacketDeliveryState,
 	pktSendTime monotime.Time,
 	ackedBytes protocol.ByteCount,
 	now monotime.Time,
-) RateSample {
-	// Update connection-level counters.
+) {
+	// Update connection-level counters (C.delivered, C.delivered_time).
 	e.delivered += ackedBytes
 	e.deliveredTime = now
 
-	// Spec §4.1.2.3 GenerateRateSample():
-	//   "Clear app-limited field if bubble is ACKed and gone."
-	//   if (C.app_limited and C.delivered > C.app_limited)
-	//     C.app_limited = 0
+	// "Update info using the newest packet" (spec §4.1.2.3).
+	// IsNewestPacket: P.send_time >= C.first_send_time (in our case we use
+	// the reference packet's send time tracked in rsRefSendTime).
+	// In QUIC, packets are sent in order, so the last packet in the ACK
+	// range is always the newest. We use >= to handle equal timestamps.
+	if !e.rsHasData || pktSendTime >= e.rsRefSendTime {
+		e.rsHasData = true
+		e.rsPriorDelivered = pktState.Delivered
+		e.rsPriorTime = pktState.DeliveredTime
+		e.rsIsAppLimited = pktState.IsAppLimited
+		e.rsSendElapsed = pktSendTime.Sub(pktState.FirstSentTime)
+		e.rsAckElapsed = now.Sub(pktState.DeliveredTime)
+		e.rsRefSendTime = pktSendTime
+
+		// Spec §4.1.2.3: C.first_send_time = P.send_time
+		// This is the CRITICAL update that anchors the next flight's
+		// sendElapsed to a recent reference point, preventing sendElapsed
+		// from growing unbounded over the connection lifetime.
+		e.firstSentTime = pktSendTime
+	}
+}
+
+// GenerateRateSample computes the final delivery rate sample after all
+// packets in an ACK event have been processed via UpdateRateSample.
+// Must be called once after all UpdateRateSample calls for the ACK.
+//
+// Returns a zero-rate RateSample if no valid sample could be computed.
+//
+// Spec §4.1.2.3 GenerateRateSample.
+func (e *DeliveryRateEstimator) GenerateRateSample() RateSample {
+	// Spec §4.1.2.3: Clear app-limited field if bubble is ACKed and gone.
 	if e.appLimited != 0 && e.delivered > e.appLimited {
 		e.appLimited = 0
 	}
 
-	// Compute elapsed intervals.
-	sendElapsed := pktSendTime.Sub(pktState.FirstSentTime)
-	ackElapsed := now.Sub(pktState.DeliveredTime)
+	if !e.rsHasData || e.rsPriorTime == 0 {
+		return RateSample{} // nothing delivered on this ACK
+	}
 
-	// The interval is the larger of the two: this makes the estimate immune
-	// to ACK compression/aggregation.
-	interval := max(sendElapsed, ackElapsed)
+	// Use the longer of send_elapsed and ack_elapsed (spec §4.1.2.3).
+	interval := max(e.rsSendElapsed, e.rsAckElapsed)
 
-	// Guard against zero or negative intervals.
 	if interval <= 0 {
 		return RateSample{
-			IsAppLimited:   pktState.IsAppLimited,
+			IsAppLimited:   e.rsIsAppLimited,
 			Delivered:      e.delivered,
-			PriorDelivered: pktState.Delivered,
-			PriorTime:      pktState.DeliveredTime,
-			SendElapsed:    sendElapsed,
-			AckElapsed:     ackElapsed,
+			PriorDelivered: e.rsPriorDelivered,
+			PriorTime:      e.rsPriorTime,
+			SendElapsed:    e.rsSendElapsed,
+			AckElapsed:     e.rsAckElapsed,
 		}
 	}
 
-	// delivered_delta = total delivered now - delivered when this pkt was sent.
-	deliveredDelta := e.delivered - pktState.Delivered
+	// RS.delivered = C.delivered - RS.prior_delivered
+	deliveredDelta := e.delivered - e.rsPriorDelivered
 
-	// delivery_rate = delivered_delta / interval (in bits/s).
+	// RS.delivery_rate = RS.delivered / RS.interval
 	deliveryRate := BandwidthFromDelta(deliveredDelta, interval)
 
 	return RateSample{
 		DeliveryRate:   deliveryRate,
-		IsAppLimited:   pktState.IsAppLimited,
+		IsAppLimited:   e.rsIsAppLimited,
 		Interval:       interval,
 		Delivered:      e.delivered,
-		PriorDelivered: pktState.Delivered,
-		PriorTime:      pktState.DeliveredTime,
-		SendElapsed:    sendElapsed,
-		AckElapsed:     ackElapsed,
+		PriorDelivered: e.rsPriorDelivered,
+		PriorTime:      e.rsPriorTime,
+		SendElapsed:    e.rsSendElapsed,
+		AckElapsed:     e.rsAckElapsed,
 	}
 }
 
