@@ -640,8 +640,11 @@ func (b *bbrv3Sender) OnBandwidthSample(sample RateSample) {
 	if sample.DeliveryRate > b.bwLatest {
 		b.bwLatest = sample.DeliveryRate
 	}
-	if sample.Delivered > b.inflightLatest {
-		b.inflightLatest = sample.Delivered
+	// Spec: BBR.inflight_latest = max(BBR.inflight_latest, RS.delivered)
+	// RS.delivered is the delta: C.delivered - RS.prior_delivered (spec §4.1.2.3).
+	rsDelivered := sample.Delivered - sample.PriorDelivered
+	if rsDelivered > b.inflightLatest {
+		b.inflightLatest = rsDelivered
 	}
 	if sample.PriorDelivered >= b.lossRoundDelivered {
 		b.lossRoundDelivered = sample.Delivered
@@ -692,7 +695,8 @@ func (b *bbrv3Sender) OnBandwidthSample(sample RateSample) {
 	// --- Advance latest delivery signals (spec §5.5.10.3 BBRAdvanceLatestDeliverySignals) ---
 	if b.lossRoundStart {
 		b.bwLatest = sample.DeliveryRate
-		b.inflightLatest = sample.Delivered
+		// Reset to current RS.delivered delta (not cumulative).
+		b.inflightLatest = rsDelivered
 	}
 
 	// --- Bound BW for model (spec §5.5.10.3 BBRBoundBWForModel) ---
@@ -1145,6 +1149,7 @@ func (b *bbrv3Sender) enterProbeBW() {
 
 func (b *bbrv3Sender) startProbeBWDown() {
 	b.resetCongestionSignals()
+	b.bwProbeSamples = 0  // disarm per-packet loss response (probing is over)
 	b.probeUpCnt = infMax // not growing inflight_longterm
 	b.pickProbeWait()
 	b.cycleStamp = b.clock.Now()
