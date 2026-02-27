@@ -32,6 +32,7 @@ type packet struct {
 	firstSentTimeAtSend monotime.Time      // send time of first packet in flight when this was sent
 	isAppLimitedAtSend  bool               // whether the connection was app-limited at send time
 	bytesInFlightAtSend protocol.ByteCount // C.inflight when this packet was sent (for BBRv3 tx_in_flight)
+	lostAtSend          protocol.ByteCount // C.lost when this packet was sent (for BBRv3 per-packet loss)
 }
 
 func (p *packet) Outstanding() bool {
@@ -60,6 +61,7 @@ func getPacket() *packet {
 	p.firstSentTimeAtSend = 0
 	p.isAppLimitedAtSend = false
 	p.bytesInFlightAtSend = 0
+	p.lostAtSend = 0
 	return p
 }
 

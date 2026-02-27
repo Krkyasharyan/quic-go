@@ -196,7 +196,7 @@ func (c *cubicSender) OnPacketAcked(
 	}
 }
 
-func (c *cubicSender) OnCongestionEvent(packetNumber protocol.PacketNumber, lostBytes, priorInFlight protocol.ByteCount) {
+func (c *cubicSender) OnCongestionEvent(packetNumber protocol.PacketNumber, lostBytes, priorInFlight, _ /* txInFlight */, _ /* lostSinceTransmit */ protocol.ByteCount) {
 	c.connStats.PacketsLost.Add(1)
 	c.connStats.BytesLost.Add(uint64(lostBytes))
 

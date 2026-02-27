@@ -111,6 +111,9 @@ type DeliveryRateEstimator struct {
 	// rsRefSendTime is the send time of the reference (newest) packet,
 	// used to update C.first_send_time after GenerateRateSample.
 	rsRefSendTime monotime.Time
+	// rsTxInFlight is P.tx_in_flight (bytes in flight at send time) of the
+	// reference packet, forwarded to the rate sample for adaptLongTermModel.
+	rsTxInFlight protocol.ByteCount
 }
 
 // NewDeliveryRateEstimator creates a new estimator with zero state.
@@ -157,6 +160,7 @@ func (e *DeliveryRateEstimator) InitRateSample() {
 	e.rsSendElapsed = 0
 	e.rsAckElapsed = 0
 	e.rsRefSendTime = 0
+	e.rsTxInFlight = 0
 }
 
 // UpdateRateSample is called for each newly acknowledged packet. It updates
@@ -166,6 +170,7 @@ func (e *DeliveryRateEstimator) InitRateSample() {
 // pktState is the delivery snapshot stored on the packet at send time.
 // pktSendTime is the packet's original send timestamp.
 // ackedBytes is the wire size of the acknowledged packet.
+// pktTxInFlight is the bytes in flight when this packet was sent (P.tx_in_flight).
 // now is the current time (ACK receipt time).
 //
 // Spec §4.1.2.3 UpdateRateSample.
@@ -173,6 +178,7 @@ func (e *DeliveryRateEstimator) UpdateRateSample(
 	pktState PacketDeliveryState,
 	pktSendTime monotime.Time,
 	ackedBytes protocol.ByteCount,
+	pktTxInFlight protocol.ByteCount,
 	now monotime.Time,
 ) {
 	// Update connection-level counters (C.delivered, C.delivered_time).
@@ -192,6 +198,7 @@ func (e *DeliveryRateEstimator) UpdateRateSample(
 		e.rsSendElapsed = pktSendTime.Sub(pktState.FirstSentTime)
 		e.rsAckElapsed = now.Sub(pktState.DeliveredTime)
 		e.rsRefSendTime = pktSendTime
+		e.rsTxInFlight = pktTxInFlight
 
 		// Spec §4.1.2.3: C.first_send_time = P.send_time
 		// This is the CRITICAL update that anchors the next flight's
@@ -229,6 +236,7 @@ func (e *DeliveryRateEstimator) GenerateRateSample() RateSample {
 			PriorTime:      e.rsPriorTime,
 			SendElapsed:    e.rsSendElapsed,
 			AckElapsed:     e.rsAckElapsed,
+			TxInFlight:     e.rsTxInFlight,
 		}
 	}
 
@@ -247,6 +255,7 @@ func (e *DeliveryRateEstimator) GenerateRateSample() RateSample {
 		PriorTime:      e.rsPriorTime,
 		SendElapsed:    e.rsSendElapsed,
 		AckElapsed:     e.rsAckElapsed,
+		TxInFlight:     e.rsTxInFlight,
 	}
 }
 

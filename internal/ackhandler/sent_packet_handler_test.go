@@ -1126,7 +1126,7 @@ func TestSentPacketHandlerCongestion(t *testing.T) {
 	ackTime := sendTimes[3].Add(time.Second)
 	gomock.InOrder(
 		cong.EXPECT().MaybeExitSlowStart(),
-		cong.EXPECT().OnCongestionEvent(pns[0], protocol.ByteCount(1000), protocol.ByteCount(5000)),
+		cong.EXPECT().OnCongestionEvent(pns[0], protocol.ByteCount(1000), protocol.ByteCount(5000), gomock.Any(), gomock.Any()),
 		cong.EXPECT().OnPacketAcked(pns[2], protocol.ByteCount(1000), protocol.ByteCount(5000), ackTime),
 		cong.EXPECT().OnPacketAcked(pns[3], protocol.ByteCount(1000), protocol.ByteCount(5000), ackTime),
 	)
@@ -1307,7 +1307,7 @@ func TestSentPacketHandlerECN(t *testing.T) {
 	pns[3] = sendPacket(t, now, protocol.ECT0)
 
 	// Receive an ACK with a short RTT, such that the first packet is lost.
-	cong.EXPECT().OnCongestionEvent(gomock.Any(), gomock.Any(), gomock.Any())
+	cong.EXPECT().OnCongestionEvent(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any())
 	ecnHandler.EXPECT().LostPacket(pns[0])
 	ecnHandler.EXPECT().HandleNewlyAcked(gomock.Any(), int64(10), int64(11), int64(12)).DoAndReturn(func(packets []packetWithPacketNumber, _, _, _ int64) bool {
 		require.Len(t, packets, 2)
@@ -1363,7 +1363,7 @@ func TestSentPacketHandlerECN(t *testing.T) {
 
 	gomock.InOrder(
 		ecnHandler.EXPECT().HandleNewlyAcked(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(true),
-		cong.EXPECT().OnCongestionEvent(pns[0], protocol.ByteCount(0), gomock.Any()),
+		cong.EXPECT().OnCongestionEvent(pns[0], protocol.ByteCount(0), gomock.Any(), gomock.Any(), gomock.Any()),
 	)
 	_, err = sph.ReceivedAck(&wire.AckFrame{AckRanges: ackRanges(pns[0])}, protocol.Encryption1RTT, now.Add(100*time.Millisecond))
 	require.NoError(t, err)

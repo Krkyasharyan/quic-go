@@ -87,7 +87,8 @@ type sentPacketHandler struct {
 
 	ackedPackets []packetWithPacketNumber // to avoid allocations in detectAndRemoveAckedPackets
 
-	bytesInFlight protocol.ByteCount
+	bytesInFlight  protocol.ByteCount
+	cumulativeLost protocol.ByteCount // cumulative bytes lost over connection lifetime (for BBRv3 C.lost)
 
 	congestion        congestion.SendAlgorithmWithDebugInfos
 	congestionAlgo    protocol.CongestionControlAlgorithm
@@ -333,6 +334,7 @@ func (h *sentPacketHandler) SentPacket(
 	p.firstSentTimeAtSend = ds.FirstSentTime
 	p.isAppLimitedAtSend = ds.IsAppLimited
 	p.bytesInFlightAtSend = priorBytesInFlight
+	p.lostAtSend = h.cumulativeLost
 
 	h.congestion.OnPacketSent(t, h.bytesInFlight, pn, size, isAckEliciting)
 
@@ -467,7 +469,7 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 			if ecnConsumer, ok := h.congestion.(congestion.ECNCongestionConsumer); ok {
 				ecnConsumer.OnECNCongestion(priorInFlight)
 			} else {
-				h.congestion.OnCongestionEvent(largestAcked, 0, priorInFlight)
+				h.congestion.OnCongestionEvent(largestAcked, 0, priorInFlight, 0, 0)
 			}
 		}
 	}
@@ -502,7 +504,7 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 				FirstSentTime: p.firstSentTimeAtSend,
 				IsAppLimited:  p.isAppLimitedAtSend,
 			}
-			h.deliveryEstimator.UpdateRateSample(pktState, p.SendTime, p.Length, rcvTime)
+			h.deliveryEstimator.UpdateRateSample(pktState, p.SendTime, p.Length, p.bytesInFlightAtSend, rcvTime)
 		}
 		if p.EncryptionLevel == protocol.Encryption1RTT {
 			acked1RTTPacket = true
@@ -931,7 +933,9 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 				h.removeFromBytesInFlight(p)
 				h.queueFramesForRetransmission(p)
 				if !p.IsPathMTUProbePacket {
-					h.congestion.OnCongestionEvent(pn, p.Length, priorInFlight)
+					h.cumulativeLost += p.Length
+					lostSinceTransmit := h.cumulativeLost - p.lostAtSend
+					h.congestion.OnCongestionEvent(pn, p.Length, priorInFlight, p.bytesInFlightAtSend, lostSinceTransmit)
 				}
 				if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil {
 					h.ecnTracker.LostPacket(pn)

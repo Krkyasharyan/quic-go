@@ -83,13 +83,13 @@ func (s *testCubicSender) AckNPackets(n int) {
 func (s *testCubicSender) LoseNPacketsLen(n int, packetLength protocol.ByteCount) {
 	for range n {
 		s.ackedPacketNumber++
-		s.sender.OnCongestionEvent(s.ackedPacketNumber, packetLength, s.bytesInFlight)
+		s.sender.OnCongestionEvent(s.ackedPacketNumber, packetLength, s.bytesInFlight, 0, 0)
 	}
 	s.bytesInFlight -= protocol.ByteCount(n) * packetLength
 }
 
 func (s *testCubicSender) LosePacket(number protocol.PacketNumber) {
-	s.sender.OnCongestionEvent(number, maxDatagramSize, s.bytesInFlight)
+	s.sender.OnCongestionEvent(number, maxDatagramSize, s.bytesInFlight, 0, 0)
 	s.bytesInFlight -= maxDatagramSize
 }
 

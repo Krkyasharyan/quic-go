@@ -268,15 +268,15 @@ func (c *MockSendAlgorithmWithDebugInfosMaybeExitSlowStartCall) DoAndReturn(f fu
 }
 
 // OnCongestionEvent mocks base method.
-func (m *MockSendAlgorithmWithDebugInfos) OnCongestionEvent(number protocol.PacketNumber, lostBytes, priorInFlight protocol.ByteCount) {
+func (m *MockSendAlgorithmWithDebugInfos) OnCongestionEvent(number protocol.PacketNumber, lostBytes, priorInFlight, txInFlight, lostSinceTransmit protocol.ByteCount) {
 	m.ctrl.T.Helper()
-	m.ctrl.Call(m, "OnCongestionEvent", number, lostBytes, priorInFlight)
+	m.ctrl.Call(m, "OnCongestionEvent", number, lostBytes, priorInFlight, txInFlight, lostSinceTransmit)
 }
 
 // OnCongestionEvent indicates an expected call of OnCongestionEvent.
-func (mr *MockSendAlgorithmWithDebugInfosMockRecorder) OnCongestionEvent(number, lostBytes, priorInFlight any) *MockSendAlgorithmWithDebugInfosOnCongestionEventCall {
+func (mr *MockSendAlgorithmWithDebugInfosMockRecorder) OnCongestionEvent(number, lostBytes, priorInFlight, txInFlight, lostSinceTransmit any) *MockSendAlgorithmWithDebugInfosOnCongestionEventCall {
 	mr.mock.ctrl.T.Helper()
-	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "OnCongestionEvent", reflect.TypeOf((*MockSendAlgorithmWithDebugInfos)(nil).OnCongestionEvent), number, lostBytes, priorInFlight)
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "OnCongestionEvent", reflect.TypeOf((*MockSendAlgorithmWithDebugInfos)(nil).OnCongestionEvent), number, lostBytes, priorInFlight, txInFlight, lostSinceTransmit)
 	return &MockSendAlgorithmWithDebugInfosOnCongestionEventCall{Call: call}
 }
 
@@ -292,13 +292,13 @@ func (c *MockSendAlgorithmWithDebugInfosOnCongestionEventCall) Return() *MockSen
 }
 
 // Do rewrite *gomock.Call.Do
-func (c *MockSendAlgorithmWithDebugInfosOnCongestionEventCall) Do(f func(protocol.PacketNumber, protocol.ByteCount, protocol.ByteCount)) *MockSendAlgorithmWithDebugInfosOnCongestionEventCall {
+func (c *MockSendAlgorithmWithDebugInfosOnCongestionEventCall) Do(f func(protocol.PacketNumber, protocol.ByteCount, protocol.ByteCount, protocol.ByteCount, protocol.ByteCount)) *MockSendAlgorithmWithDebugInfosOnCongestionEventCall {
 	c.Call = c.Call.Do(f)
 	return c
 }
 
 // DoAndReturn rewrite *gomock.Call.DoAndReturn
-func (c *MockSendAlgorithmWithDebugInfosOnCongestionEventCall) DoAndReturn(f func(protocol.PacketNumber, protocol.ByteCount, protocol.ByteCount)) *MockSendAlgorithmWithDebugInfosOnCongestionEventCall {
+func (c *MockSendAlgorithmWithDebugInfosOnCongestionEventCall) DoAndReturn(f func(protocol.PacketNumber, protocol.ByteCount, protocol.ByteCount, protocol.ByteCount, protocol.ByteCount)) *MockSendAlgorithmWithDebugInfosOnCongestionEventCall {
 	c.Call = c.Call.DoAndReturn(f)
 	return c
 }

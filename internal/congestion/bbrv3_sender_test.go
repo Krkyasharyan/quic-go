@@ -27,12 +27,15 @@ type testBBRSender struct {
 	// Delivery rate estimation mirroring sent_packet_handler wiring.
 	estimator *DeliveryRateEstimator
 	// Per-packet snapshots keyed by packet number.
-	pktStates map[protocol.PacketNumber]pktSnapshot
+	pktStates      map[protocol.PacketNumber]pktSnapshot
+	cumulativeLost protocol.ByteCount // mirrors sent_packet_handler.cumulativeLost
 }
 
 type pktSnapshot struct {
-	state    PacketDeliveryState
-	sendTime monotime.Time
+	state         PacketDeliveryState
+	sendTime      monotime.Time
+	bytesInFlight protocol.ByteCount // C.inflight at send time (for tx_in_flight)
+	lostAtSend    protocol.ByteCount // C.lost at send time
 }
 
 func newTestBBRSender() *testBBRSender {
@@ -71,7 +74,12 @@ func (s *testBBRSender) sendPacket() {
 		s.estimator.ClearAppLimited()
 	}
 	ds := s.estimator.OnPacketSent(s.clock.Now(), s.bytesInFlight)
-	s.pktStates[s.packetNumber] = pktSnapshot{state: ds, sendTime: s.clock.Now()}
+	s.pktStates[s.packetNumber] = pktSnapshot{
+		state:         ds,
+		sendTime:      s.clock.Now(),
+		bytesInFlight: s.bytesInFlight,
+		lostAtSend:    s.cumulativeLost,
+	}
 
 	s.sender.OnPacketSent(s.clock.Now(), s.bytesInFlight, s.packetNumber, bbrTestMaxDatagramSize, true)
 	s.bytesInFlight += bbrTestMaxDatagramSize
@@ -89,7 +97,12 @@ func (s *testBBRSender) sendNPackets(n int) {
 func (s *testBBRSender) sendAppLimitedPacket() {
 	s.estimator.MarkAppLimited(s.bytesInFlight)
 	ds := s.estimator.OnPacketSent(s.clock.Now(), s.bytesInFlight)
-	s.pktStates[s.packetNumber] = pktSnapshot{state: ds, sendTime: s.clock.Now()}
+	s.pktStates[s.packetNumber] = pktSnapshot{
+		state:         ds,
+		sendTime:      s.clock.Now(),
+		bytesInFlight: s.bytesInFlight,
+		lostAtSend:    s.cumulativeLost,
+	}
 
 	s.sender.OnPacketSent(s.clock.Now(), s.bytesInFlight, s.packetNumber, bbrTestMaxDatagramSize, true)
 	s.bytesInFlight += bbrTestMaxDatagramSize
@@ -108,7 +121,7 @@ func (s *testBBRSender) ackNPackets(n int, rtt time.Duration) {
 
 		if snap, ok := s.pktStates[s.ackedPacketNumber]; ok {
 			s.estimator.UpdateRateSample(
-				snap.state, snap.sendTime, bbrTestMaxDatagramSize, s.clock.Now(),
+				snap.state, snap.sendTime, bbrTestMaxDatagramSize, snap.bytesInFlight, s.clock.Now(),
 			)
 			delete(s.pktStates, s.ackedPacketNumber)
 		}
@@ -134,10 +147,24 @@ func (s *testBBRSender) ackNPackets(n int, rtt time.Duration) {
 func (s *testBBRSender) loseNPackets(n int) {
 	for range n {
 		s.ackedPacketNumber++
+		// Compute per-packet loss metadata (mirrors sent_packet_handler).
+		txInFlight := protocol.ByteCount(0)
+		var lostSinceTransmit protocol.ByteCount
+		if snap, ok := s.pktStates[s.ackedPacketNumber]; ok {
+			txInFlight = snap.bytesInFlight
+			s.cumulativeLost += bbrTestMaxDatagramSize
+			lostSinceTransmit = s.cumulativeLost - snap.lostAtSend
+			delete(s.pktStates, s.ackedPacketNumber)
+		} else {
+			s.cumulativeLost += bbrTestMaxDatagramSize
+			lostSinceTransmit = bbrTestMaxDatagramSize
+		}
 		s.sender.OnCongestionEvent(
 			s.ackedPacketNumber,
 			bbrTestMaxDatagramSize,
 			s.bytesInFlight,
+			txInFlight,
+			lostSinceTransmit,
 		)
 		if s.bytesInFlight >= bbrTestMaxDatagramSize {
 			s.bytesInFlight -= bbrTestMaxDatagramSize
@@ -776,13 +803,15 @@ func TestBBRv3LossInRefillTightensInflightLo(t *testing.T) {
 	// Send packets.
 	s.sendNPackets(10)
 
-	// Lose a packet during REFILL — handleInflightTooHigh sets inflightLongterm.
-	// (REFILL is a probing phase, so adaptLowerBoundsFromCongestion skips it;
-	// loss during REFILL affects the long-term bound via handleInflightTooHigh.)
-	s.loseNPackets(1)
+	// Lose enough packets during REFILL to exceed the 2% IsInflightTooHigh
+	// threshold. The first lost packet may have txInFlight=0 (sent when pipe
+	// was empty), which doesn't cross the threshold. The second packet has
+	// txInFlight > 0 and lostSinceTransmit well above 2%, triggering
+	// handleInflightTooHigh which sets inflightLongterm (inflightHi).
+	s.loseNPackets(2)
 
 	require.Greater(t, s.sender.InflightHi(), protocol.ByteCount(0),
-		"inflightHi should be set after loss in REFILL")
+		"inflightHi should be set after excessive loss in REFILL")
 }
 
 func TestBBRv3LossInProbeRTTSetsInflightHi(t *testing.T) {
@@ -954,7 +983,7 @@ func TestBBRv3AppLimitedSampleRejectedWhenBtlBwZero(t *testing.T) {
 	s.ackedPacketNumber++
 	snap := s.pktStates[s.ackedPacketNumber]
 	s.estimator.InitRateSample()
-	s.estimator.UpdateRateSample(snap.state, snap.sendTime, bbrTestMaxDatagramSize, s.clock.Now())
+	s.estimator.UpdateRateSample(snap.state, snap.sendTime, bbrTestMaxDatagramSize, snap.bytesInFlight, s.clock.Now())
 	sample := s.estimator.GenerateRateSample()
 	require.True(t, sample.IsAppLimited)
 	require.True(t, sample.DeliveryRate > 0)
@@ -993,7 +1022,7 @@ func TestBBRv3AppLimitedSampleAcceptedWhenExceedsBtlBw(t *testing.T) {
 	s.ackedPacketNumber++
 	snap := s.pktStates[s.ackedPacketNumber]
 	s.estimator.InitRateSample()
-	s.estimator.UpdateRateSample(snap.state, snap.sendTime, bbrTestMaxDatagramSize, s.clock.Now())
+	s.estimator.UpdateRateSample(snap.state, snap.sendTime, bbrTestMaxDatagramSize, snap.bytesInFlight, s.clock.Now())
 	sample := s.estimator.GenerateRateSample()
 	require.True(t, sample.IsAppLimited)
 	delete(s.pktStates, s.ackedPacketNumber)
@@ -1034,7 +1063,7 @@ func TestBBRv3StartupIgnoresAppLimitedRounds(t *testing.T) {
 		s.ackedPacketNumber++
 		snap := s.pktStates[s.ackedPacketNumber]
 		s.estimator.InitRateSample()
-		s.estimator.UpdateRateSample(snap.state, snap.sendTime, bbrTestMaxDatagramSize, s.clock.Now())
+		s.estimator.UpdateRateSample(snap.state, snap.sendTime, bbrTestMaxDatagramSize, snap.bytesInFlight, s.clock.Now())
 		sample := s.estimator.GenerateRateSample()
 		delete(s.pktStates, s.ackedPacketNumber)
 		s.sender.OnPacketAcked(s.ackedPacketNumber, bbrTestMaxDatagramSize, s.bytesInFlight, s.clock.Now())
@@ -1070,7 +1099,7 @@ func TestBBRv3BestSamplePrefersNonAppLimited(t *testing.T) {
 		s.ackedPacketNumber++
 		if snap, ok := s.pktStates[s.ackedPacketNumber]; ok {
 			s.estimator.InitRateSample()
-			s.estimator.UpdateRateSample(snap.state, snap.sendTime, bbrTestMaxDatagramSize, s.clock.Now())
+			s.estimator.UpdateRateSample(snap.state, snap.sendTime, bbrTestMaxDatagramSize, snap.bytesInFlight, s.clock.Now())
 			sample := s.estimator.GenerateRateSample()
 			samples = append(samples, sample)
 			delete(s.pktStates, s.ackedPacketNumber)
@@ -1122,7 +1151,7 @@ func TestBBRv3NormalOperationAfterAppLimitedPhase(t *testing.T) {
 		s.ackedPacketNumber++
 		if snap, ok := s.pktStates[s.ackedPacketNumber]; ok {
 			s.estimator.InitRateSample()
-			s.estimator.UpdateRateSample(snap.state, snap.sendTime, bbrTestMaxDatagramSize, s.clock.Now())
+			s.estimator.UpdateRateSample(snap.state, snap.sendTime, bbrTestMaxDatagramSize, snap.bytesInFlight, s.clock.Now())
 			sample := s.estimator.GenerateRateSample()
 			delete(s.pktStates, s.ackedPacketNumber)
 			s.sender.OnPacketAcked(s.ackedPacketNumber, bbrTestMaxDatagramSize, s.bytesInFlight, s.clock.Now())

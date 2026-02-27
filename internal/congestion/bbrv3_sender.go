@@ -482,12 +482,27 @@ func (b *bbrv3Sender) OnCongestionEvent(
 	packetNumber protocol.PacketNumber,
 	lostBytes protocol.ByteCount,
 	priorInFlight protocol.ByteCount,
+	txInFlight protocol.ByteCount,
+	lostSinceTransmit protocol.ByteCount,
 ) {
 	b.connStats.PacketsLost.Add(1)
 	b.connStats.BytesLost.Add(uint64(lostBytes))
 
 	// Note loss for this round (spec §5.5.10 BBRNoteLoss)
 	b.noteLoss(lostBytes)
+
+	// ProbeBW uses its own per-packet one-shot (bwProbeSamples) per spec
+	// §5.5.10.2 BBRHandleLostPacket. Each packet is checked individually
+	// against IsInflightTooHigh(); the first packet crossing the threshold
+	// triggers the response and zeros bwProbeSamples to prevent further
+	// reaction. The largestSentAtLastCutback guard must NOT gate this path,
+	// because the first packet in an event may have txInFlight=0 (sent when
+	// pipe was empty) and fail the threshold check, while a later packet
+	// with higher txInFlight would correctly trigger it.
+	if b.mode == bbrProbeBW {
+		b.handleProbeBWLoss(txInFlight, lostSinceTransmit, lostBytes)
+		return
+	}
 
 	if packetNumber <= b.largestSentAtLastCutback {
 		return
@@ -497,8 +512,6 @@ func (b *bbrv3Sender) OnCongestionEvent(
 	switch b.mode {
 	case bbrStartup:
 		b.handleStartupLoss(priorInFlight)
-	case bbrProbeBW:
-		b.handleProbeBWLoss(priorInFlight, lostBytes)
 	case bbrDrain:
 		// No cwnd cut in Drain.
 	case bbrProbeRTT:
@@ -897,23 +910,69 @@ func (b *bbrv3Sender) handleStartupLoss(priorInFlight protocol.ByteCount) {
 	}
 }
 
-// handleProbeBWLoss implements loss response during ProbeBW. Spec §5.5.10.2.
-func (b *bbrv3Sender) handleProbeBWLoss(priorInFlight protocol.ByteCount, lostBytes protocol.ByteCount) {
-	_ = lostBytes
-	switch b.probeBWPhase {
-	case probeBWUp:
-		if b.lossInRound && b.bwProbeSamples > 0 {
-			// Construct a minimal sample for handleInflightTooHigh.
-			b.handleInflightTooHigh(RateSample{TxInFlight: priorInFlight})
-		}
-	case probeBWRefill:
-		// Loss in REFILL: only react if probing.
-		if b.lossInRound && b.bwProbeSamples > 0 {
-			b.handleInflightTooHigh(RateSample{TxInFlight: priorInFlight})
-		}
-	case probeBWCruise, probeBWDown:
-		// Loss during non-probing phases handled by short-term model in adaptLowerBoundsFromCongestion.
+// handleProbeBWLoss implements per-packet loss response during ProbeBW.
+// Spec §5.2.4 BBRHandleLostPacket + §5.5.10.2.
+//
+// txInFlight is the bytes in flight when the lost packet was *sent* (P.tx_in_flight).
+// lostSinceTransmit is cumulative bytes lost between transmit and now (RS.lost = C.lost - P.lost).
+// packetSize is the size of the lost packet itself.
+func (b *bbrv3Sender) handleProbeBWLoss(txInFlight protocol.ByteCount, lostSinceTransmit protocol.ByteCount, packetSize protocol.ByteCount) {
+	if b.bwProbeSamples == 0 {
+		return // not a packet sent while probing bandwidth
 	}
+
+	// Construct per-packet rate sample with loss info (spec §5.5.10.2).
+	rs := RateSample{
+		TxInFlight: txInFlight,
+		PacketLost: lostSinceTransmit,
+		PacketSize: packetSize,
+	}
+
+	// Only react if loss rate exceeds the threshold (spec §5.5.10.2 IsInflightTooHigh).
+	if !b.isInflightTooHigh(rs) {
+		return
+	}
+
+	// Spec §5.5.10.2 BBRHandleLostPacket:
+	// RS.tx_in_flight = BBRInflightAtLoss(rs, packet)
+	rs.TxInFlight = b.inflightAtLoss(rs)
+
+	// BBRHandleInflightTooHigh() — caps inflightLongterm and exits UP if needed.
+	b.handleInflightTooHigh(rs)
+}
+
+// inflightAtLoss estimates at what C.inflight value loss rate crossed
+// BBR.LossThresh. Spec §5.5.10.2 BBRInflightAtLoss.
+//
+// This narrows the inflight estimate to the point where losses actually
+// became excessive, which is more accurate than using the raw tx_in_flight
+// (which may be much higher for TSO/GSO bursts).
+func (b *bbrv3Sender) inflightAtLoss(rs RateSample) protocol.ByteCount {
+	size := rs.PacketSize
+	if size == 0 {
+		size = b.maxDatagramSize
+	}
+	// What was in flight before this packet?
+	inflightPrev := rs.TxInFlight
+	if inflightPrev > size {
+		inflightPrev -= size
+	} else {
+		inflightPrev = 0
+	}
+	// What was lost before this packet?
+	lostPrev := rs.PacketLost
+	if lostPrev > size {
+		lostPrev -= size
+	} else {
+		lostPrev = 0
+	}
+	// Solve: lost_prefix = (LossThresh * inflight_prev - lost_prev) / (1 - LossThresh)
+	numerator := float64(inflightPrev)*bbrLossThreshold - float64(lostPrev)
+	if numerator < 0 {
+		numerator = 0
+	}
+	lostPrefix := protocol.ByteCount(numerator / (1 - bbrLossThreshold))
+	return inflightPrev + lostPrefix
 }
 
 // adaptLowerBoundsFromCongestion: spec §5.5.10.3 BBRAdaptLowerBoundsFromCongestion.
