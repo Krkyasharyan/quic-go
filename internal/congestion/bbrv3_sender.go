@@ -750,8 +750,13 @@ func (b *bbrv3Sender) boundBWForModel() {
 	}
 }
 
-// adaptLongTermModel implements spec §5.3.3.6 BBRAdaptLongTermModel.
+// adaptLongTermModel implements spec §5.3.3.6 BBRAdaptUpperBounds.
+// Only runs after Startup, since BBRAdaptUpperBounds is called from
+// BBRUpdateProbeBWCyclePhase which gates on full_bw_reached.
 func (b *bbrv3Sender) adaptLongTermModel(sample RateSample) {
+	if !b.fullBwReached {
+		return
+	}
 	if b.ackPhase == acksProbeStarting && b.newRoundSinceLastBwSample {
 		b.ackPhase = acksProbeFeedback
 	}

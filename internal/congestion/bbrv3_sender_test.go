@@ -1968,6 +1968,56 @@ func TestBBRv3PostBandwidthSampleReboundsCwnd(t *testing.T) {
 		"PostBandwidthSample should have bounded cwnd to inflightWithHeadroom")
 }
 
+// ---------- Bug 8: adaptLongTermModel must not run during Startup ----------
+
+func TestBBRv3AdaptLongTermModelSkippedDuringStartup(t *testing.T) {
+	// During Startup, adaptLongTermModel must be a no-op. Otherwise,
+	// the else-branch ratchets inflightLongterm upward on every ACK
+	// (via TxInFlight > inflightLongterm), bloating it to 100x BDP.
+	s := newTestBBRSender()
+	rtt := 50 * time.Millisecond
+
+	require.Equal(t, bbrStartup, s.sender.Mode())
+
+	// Simulate handleStartupLoss having set inflightLongterm to a small value.
+	initialInflLT := protocol.ByteCount(5000)
+	s.sender.inflightLongterm = initialInflLT
+
+	// Send a burst with TxInFlight > initialInflLT, then ACK.
+	// Without the guard, adaptLongTermModel would ratchet inflightLongterm up.
+	s.sendNPackets(8) // 8 * 1280 = 10240 > 5000
+	s.clock.Advance(rtt)
+	s.ackNPackets(8, rtt)
+
+	require.Equal(t, bbrStartup, s.sender.Mode(),
+		"should still be in Startup")
+	require.False(t, s.sender.fullBwReached,
+		"fullBwReached should not be set yet")
+	// inflightLongterm must NOT have been ratcheted up by adaptLongTermModel.
+	require.Equal(t, initialInflLT, s.sender.inflightLongterm,
+		"adaptLongTermModel should not modify inflightLongterm during Startup")
+}
+
+func TestBBRv3AdaptLongTermModelRunsAfterStartup(t *testing.T) {
+	// After Startup, adaptLongTermModel should operate normally.
+	s := newTestBBRSender()
+	rtt := 100 * time.Millisecond
+
+	s.driveToState(bbrProbeBW, rtt)
+	require.True(t, s.sender.fullBwReached)
+
+	// Set inflightLongterm to a small value, then send at higher inflight.
+	smallInflLT := protocol.ByteCount(5000)
+	s.sender.inflightLongterm = smallInflLT
+
+	s.sendNPackets(16)
+	s.clock.Advance(rtt)
+	s.ackNPackets(16, rtt)
+
+	require.Greater(t, s.sender.inflightLongterm, smallInflLT,
+		"adaptLongTermModel should raise inflightLongterm after Startup")
+}
+
 // ---------- Bug 7: Startup max rounds exit ----------
 
 func TestBBRv3StartupMaxRoundsExit(t *testing.T) {
