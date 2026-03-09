@@ -114,6 +114,9 @@ type DeliveryRateEstimator struct {
 	// rsTxInFlight is P.tx_in_flight (bytes in flight at send time) of the
 	// reference packet, forwarded to the rate sample for adaptLongTermModel.
 	rsTxInFlight protocol.ByteCount
+	// rsLostAtSend is P.lost (cumulative bytes lost at send time) of the
+	// reference packet. Used to compute RS.lost = C.lost - P.lost.
+	rsLostAtSend protocol.ByteCount
 }
 
 // NewDeliveryRateEstimator creates a new estimator with zero state.
@@ -161,6 +164,7 @@ func (e *DeliveryRateEstimator) InitRateSample() {
 	e.rsAckElapsed = 0
 	e.rsRefSendTime = 0
 	e.rsTxInFlight = 0
+	e.rsLostAtSend = 0
 }
 
 // UpdateRateSample is called for each newly acknowledged packet. It updates
@@ -171,6 +175,7 @@ func (e *DeliveryRateEstimator) InitRateSample() {
 // pktSendTime is the packet's original send timestamp.
 // ackedBytes is the wire size of the acknowledged packet.
 // pktTxInFlight is the bytes in flight when this packet was sent (P.tx_in_flight).
+// pktLostAtSend is the cumulative bytes lost when this packet was sent (P.lost).
 // now is the current time (ACK receipt time).
 //
 // Spec §4.1.2.3 UpdateRateSample.
@@ -179,6 +184,7 @@ func (e *DeliveryRateEstimator) UpdateRateSample(
 	pktSendTime monotime.Time,
 	ackedBytes protocol.ByteCount,
 	pktTxInFlight protocol.ByteCount,
+	pktLostAtSend protocol.ByteCount,
 	now monotime.Time,
 ) {
 	// Update connection-level counters (C.delivered, C.delivered_time).
@@ -199,6 +205,7 @@ func (e *DeliveryRateEstimator) UpdateRateSample(
 		e.rsAckElapsed = now.Sub(pktState.DeliveredTime)
 		e.rsRefSendTime = pktSendTime
 		e.rsTxInFlight = pktTxInFlight
+		e.rsLostAtSend = pktLostAtSend
 
 		// Spec §4.1.2.3: C.first_send_time = P.send_time
 		// This is the CRITICAL update that anchors the next flight's
@@ -212,10 +219,13 @@ func (e *DeliveryRateEstimator) UpdateRateSample(
 // packets in an ACK event have been processed via UpdateRateSample.
 // Must be called once after all UpdateRateSample calls for the ACK.
 //
+// cumulativeLost is the current C.lost (total bytes lost over connection lifetime).
+// It is used to compute RS.lost = C.lost - P.lost for the reference packet.
+//
 // Returns a zero-rate RateSample if no valid sample could be computed.
 //
 // Spec §4.1.2.3 GenerateRateSample.
-func (e *DeliveryRateEstimator) GenerateRateSample() RateSample {
+func (e *DeliveryRateEstimator) GenerateRateSample(cumulativeLost protocol.ByteCount) RateSample {
 	// Spec §4.1.2.3: Clear app-limited field if bubble is ACKed and gone.
 	if e.appLimited != 0 && e.delivered > e.appLimited {
 		e.appLimited = 0
@@ -237,6 +247,7 @@ func (e *DeliveryRateEstimator) GenerateRateSample() RateSample {
 			SendElapsed:    e.rsSendElapsed,
 			AckElapsed:     e.rsAckElapsed,
 			TxInFlight:     e.rsTxInFlight,
+			PacketLost:     cumulativeLost - e.rsLostAtSend,
 		}
 	}
 
@@ -256,6 +267,7 @@ func (e *DeliveryRateEstimator) GenerateRateSample() RateSample {
 		SendElapsed:    e.rsSendElapsed,
 		AckElapsed:     e.rsAckElapsed,
 		TxInFlight:     e.rsTxInFlight,
+		PacketLost:     cumulativeLost - e.rsLostAtSend,
 	}
 }
 

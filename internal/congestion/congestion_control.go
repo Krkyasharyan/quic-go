@@ -14,11 +14,12 @@ func NewCongestionControl(
 	connStats *utils.ConnectionStats,
 	initialMaxDatagramSize protocol.ByteCount,
 	qlogger qlogwriter.Recorder,
+	connLabel string,
 ) SendAlgorithmWithDebugInfos {
 	switch algo {
 	case protocol.CongestionControlCubic:
 		return NewCubicSender(clock, rttStats, connStats, initialMaxDatagramSize, false, qlogger)
 	default:
-		return NewBBRv3Sender(clock, rttStats, connStats, initialMaxDatagramSize, qlogger)
+		return NewBBRv3Sender(clock, rttStats, connStats, initialMaxDatagramSize, qlogger, connLabel)
 	}
 }

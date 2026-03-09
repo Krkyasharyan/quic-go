@@ -42,9 +42,9 @@ func TestDeliveryRateEstimatorBatchedACK(t *testing.T) {
 	// --- ACK path: 3-phase approach ---
 	e.InitRateSample()
 	for i := 0; i < 10; i++ {
-		e.UpdateRateSample(packets[i].state, packets[i].sendTime, testPacketSize, 0, ackTime)
+		e.UpdateRateSample(packets[i].state, packets[i].sendTime, testPacketSize, 0, 0, ackTime)
 	}
-	bestSample := e.GenerateRateSample()
+	bestSample := e.GenerateRateSample(0)
 
 	// Expected: 10 * 1200 = 12000 bytes delivered over ~100ms interval.
 	// sendElapsed for last packet = 9ms, ackElapsed for first packet ≈ 100ms.
@@ -78,9 +78,9 @@ func TestDeliveryRateEstimatorSendElapsedVsAckElapsed(t *testing.T) {
 	// Case 1: ACK both at send_time + 60ms (ackElapsed for pkt1 = 60ms > sendElapsed for pkt2 = 50ms).
 	ackTime := t1 + monotime.Time(60*time.Millisecond)
 	e.InitRateSample()
-	e.UpdateRateSample(s1, t1, testPacketSize, 0, ackTime)
-	e.UpdateRateSample(s2, t2, testPacketSize, 0, ackTime)
-	sample := e.GenerateRateSample()
+	e.UpdateRateSample(s1, t1, testPacketSize, 0, 0, ackTime)
+	e.UpdateRateSample(s2, t2, testPacketSize, 0, 0, ackTime)
+	sample := e.GenerateRateSample(0)
 
 	// The reference packet is pkt2 (newest by send time).
 	require.Equal(t, 60*time.Millisecond, sample.AckElapsed, "ackElapsed should be 60ms")
@@ -100,9 +100,9 @@ func TestDeliveryRateEstimatorSendElapsedVsAckElapsed(t *testing.T) {
 
 	ackTime2 := t1b + monotime.Time(30*time.Millisecond)
 	e2.InitRateSample()
-	e2.UpdateRateSample(s1b, t1b, testPacketSize, 0, ackTime2)
-	e2.UpdateRateSample(s2b, t2b, testPacketSize, 0, ackTime2)
-	sample2 := e2.GenerateRateSample()
+	e2.UpdateRateSample(s1b, t1b, testPacketSize, 0, 0, ackTime2)
+	e2.UpdateRateSample(s2b, t2b, testPacketSize, 0, 0, ackTime2)
+	sample2 := e2.GenerateRateSample(0)
 
 	require.Equal(t, 100*time.Millisecond, sample2.SendElapsed, "sendElapsed should be 100ms")
 	require.Equal(t, 100*time.Millisecond, sample2.Interval, "interval should be max(100ms, 30ms) = 100ms")
@@ -121,8 +121,8 @@ func TestDeliveryRateEstimatorAppLimited(t *testing.T) {
 	// ACK it using 3-phase approach.
 	ackTime := now + monotime.Time(100*time.Millisecond)
 	e.InitRateSample()
-	e.UpdateRateSample(state, now, testPacketSize, 0, ackTime)
-	sample := e.GenerateRateSample()
+	e.UpdateRateSample(state, now, testPacketSize, 0, 0, ackTime)
+	sample := e.GenerateRateSample(0)
 	require.True(t, sample.IsAppLimited, "sample should be marked as app-limited")
 
 	// Clear app-limited, send a packet when NOT app-limited.
@@ -140,8 +140,8 @@ func TestDeliveryRateEstimatorZeroInterval(t *testing.T) {
 
 	// ACK immediately (same timestamp → interval = 0).
 	e.InitRateSample()
-	e.UpdateRateSample(state, now, testPacketSize, 0, now)
-	sample := e.GenerateRateSample()
+	e.UpdateRateSample(state, now, testPacketSize, 0, 0, now)
+	sample := e.GenerateRateSample(0)
 	require.Equal(t, Bandwidth(0), sample.DeliveryRate, "should return 0 for zero interval")
 }
 
@@ -156,8 +156,8 @@ func TestDeliveryRateEstimatorCumulativeDelivered(t *testing.T) {
 		sendTime := now
 		now += monotime.Time(10 * time.Millisecond)
 		e.InitRateSample()
-		e.UpdateRateSample(state, sendTime, testPacketSize, 0, now)
-		_ = e.GenerateRateSample()
+		e.UpdateRateSample(state, sendTime, testPacketSize, 0, 0, now)
+		_ = e.GenerateRateSample(0)
 	}
 
 	require.Equal(t, 3*testPacketSize, e.Delivered(), "delivered counter should be 3 packets")
@@ -180,9 +180,9 @@ func TestDeliveryRateEstimatorNewFlightResets(t *testing.T) {
 	// ACK both using 3-phase approach.
 	ackTime := now + monotime.Time(50*time.Millisecond)
 	e.InitRateSample()
-	e.UpdateRateSample(s1, s1.FirstSentTime, testPacketSize, 0, ackTime)
-	e.UpdateRateSample(s2, now, testPacketSize, 0, ackTime)
-	_ = e.GenerateRateSample()
+	e.UpdateRateSample(s1, s1.FirstSentTime, testPacketSize, 0, 0, ackTime)
+	e.UpdateRateSample(s2, now, testPacketSize, 0, 0, ackTime)
+	_ = e.GenerateRateSample(0)
 
 	// New flight (bytesInFlight=0 again).
 	now = ackTime + monotime.Time(time.Millisecond)
@@ -218,8 +218,8 @@ func TestDeliveryRateEstimatorImmunityToACKAggregation(t *testing.T) {
 	ackTimeA := pktsA[0].sendTime + monotime.Time(rtt)
 	for i := 0; i < numPackets; i++ {
 		eA.InitRateSample()
-		eA.UpdateRateSample(pktsA[i].state, pktsA[i].sendTime, testPacketSize, 0, ackTimeA)
-		sample := eA.GenerateRateSample()
+		eA.UpdateRateSample(pktsA[i].state, pktsA[i].sendTime, testPacketSize, 0, 0, ackTimeA)
+		sample := eA.GenerateRateSample(0)
 		if sample.DeliveryRate > bestRateA {
 			bestRateA = sample.DeliveryRate
 		}
@@ -240,9 +240,9 @@ func TestDeliveryRateEstimatorImmunityToACKAggregation(t *testing.T) {
 	ackTimeB := pktsB[0].sendTime + monotime.Time(rtt)
 	eB.InitRateSample()
 	for i := 0; i < numPackets; i++ {
-		eB.UpdateRateSample(pktsB[i].state, pktsB[i].sendTime, testPacketSize, 0, ackTimeB)
+		eB.UpdateRateSample(pktsB[i].state, pktsB[i].sendTime, testPacketSize, 0, 0, ackTimeB)
 	}
-	sampleB := eB.GenerateRateSample()
+	sampleB := eB.GenerateRateSample(0)
 
 	// Both should produce rates within 20% of each other.
 	ratioAB := float64(bestRateA) / float64(sampleB.DeliveryRate)

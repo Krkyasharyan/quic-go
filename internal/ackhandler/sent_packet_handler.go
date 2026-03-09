@@ -92,6 +92,7 @@ type sentPacketHandler struct {
 
 	congestion        congestion.SendAlgorithmWithDebugInfos
 	congestionAlgo    protocol.CongestionControlAlgorithm
+	connLabel         string
 	deliveryEstimator *congestion.DeliveryRateEstimator
 	rttStats          *utils.RTTStats
 	connStats         *utils.ConnectionStats
@@ -132,6 +133,7 @@ func NewSentPacketHandler(
 	pers protocol.Perspective,
 	qlogger qlogwriter.Recorder,
 	logger utils.Logger,
+	connLabel string,
 ) SentPacketHandler {
 	cc := congestion.NewCongestionControl(
 		congestionAlgo,
@@ -140,6 +142,7 @@ func NewSentPacketHandler(
 		connStats,
 		initialMaxDatagramSize,
 		qlogger,
+		connLabel,
 	)
 
 	h := &sentPacketHandler{
@@ -153,6 +156,7 @@ func NewSentPacketHandler(
 		connStats:                      connStats,
 		congestion:                     cc,
 		congestionAlgo:                 congestionAlgo,
+		connLabel:                      connLabel,
 		deliveryEstimator:              congestion.NewDeliveryRateEstimator(),
 		ignorePacketsBelow:             ignorePacketsBelow,
 		perspective:                    pers,
@@ -504,7 +508,7 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 				FirstSentTime: p.firstSentTimeAtSend,
 				IsAppLimited:  p.isAppLimitedAtSend,
 			}
-			h.deliveryEstimator.UpdateRateSample(pktState, p.SendTime, p.Length, p.bytesInFlightAtSend, rcvTime)
+			h.deliveryEstimator.UpdateRateSample(pktState, p.SendTime, p.Length, p.bytesInFlightAtSend, p.lostAtSend, rcvTime)
 		}
 		if p.EncryptionLevel == protocol.Encryption1RTT {
 			acked1RTTPacket = true
@@ -517,7 +521,7 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 
 	// --- Phase 3: GenerateRateSample (spec §4.1.2.3) ---
 	// Produces a single rate sample from the reference (newest) packet.
-	rateSample := h.deliveryEstimator.GenerateRateSample()
+	rateSample := h.deliveryEstimator.GenerateRateSample(h.cumulativeLost)
 
 	// Feed the delivery-rate sample to the congestion controller for
 	// bandwidth model update (spec §5.5 BBRUpdateModelAndState).
@@ -1229,6 +1233,7 @@ func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSi
 		h.connStats,
 		initialMaxDatagramSize,
 		h.qlogger,
+		h.connLabel,
 	)
 	h.deliveryEstimator = congestion.NewDeliveryRateEstimator()
 	h.setLossDetectionTimer(now)

@@ -17,6 +17,7 @@ func TestNewCongestionControlDefaultIsBBRv3(t *testing.T) {
 		&utils.ConnectionStats{},
 		1200,
 		nil,
+		"",
 	)
 	_, ok := cc.(*bbrv3Sender)
 	require.True(t, ok, "default (BBRv3) should return *bbrv3Sender")
@@ -30,6 +31,7 @@ func TestNewCongestionControlCubic(t *testing.T) {
 		&utils.ConnectionStats{},
 		1200,
 		nil,
+		"",
 	)
 	_, ok := cc.(*cubicSender)
 	require.True(t, ok, "Cubic should return *cubicSender")
@@ -43,6 +45,7 @@ func TestNewCongestionControlUnknownFallsBackToBBRv3(t *testing.T) {
 		&utils.ConnectionStats{},
 		1200,
 		nil,
+		"",
 	)
 	_, ok := cc.(*bbrv3Sender)
 	require.True(t, ok, "unknown algorithm should fall back to BBRv3")

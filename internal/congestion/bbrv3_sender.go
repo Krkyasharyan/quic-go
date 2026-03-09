@@ -182,6 +182,9 @@ type bbrv3Sender struct {
 	pacer     *pacer
 	qlogger   qlogwriter.Recorder
 
+	// Short identifier for the QUIC connection (used in debug logging).
+	connLabel string
+
 	// Datagram size.
 	maxDatagramSize protocol.ByteCount
 
@@ -329,12 +332,14 @@ func NewBBRv3Sender(
 	connStats *utils.ConnectionStats,
 	initialMaxDatagramSize protocol.ByteCount,
 	qlogger qlogwriter.Recorder,
+	connLabel string,
 ) *bbrv3Sender {
 	b := &bbrv3Sender{
 		rttStats:  rttStats,
 		connStats: connStats,
 		clock:     clock,
 		qlogger:   qlogger,
+		connLabel: connLabel,
 
 		maxDatagramSize: initialMaxDatagramSize,
 
@@ -740,7 +745,14 @@ func (b *bbrv3Sender) adaptLongTermModel(sample RateSample) {
 		b.ackPhase = acksInit
 	}
 
-	if !b.isInflightTooHigh(sample) {
+	if b.isInflightTooHigh(sample) {
+		// Spec §5.3.3.6: Loss rate exceeds threshold. Cap inflight_hi.
+		if b.bwProbeSamples != 0 {
+			rs := sample
+			rs.TxInFlight = b.inflightAtLoss(sample)
+			b.handleInflightTooHigh(rs)
+		}
+	} else {
 		// Loss rate is safe. Adjust upper bounds upward.
 		if b.inflightLongterm == 0 {
 			return // no upper bound to raise
@@ -1632,6 +1644,15 @@ func (b *bbrv3Sender) boundCwndForModel() {
 		cap = b.inflightShortterm
 	}
 
+	// BDP ceiling: if both inflight_hi and inflight_lo are uninitialized,
+	// cap cwnd at cwnd_gain * BDP to prevent unbounded growth.
+	if cap == infMax && b.mode != bbrStartup {
+		bdpCap := b.bdpMultiple(b.cwndGain)
+		if bdpCap > 0 {
+			cap = bdpCap
+		}
+	}
+
 	// Floor at MinPipeCwnd.
 	if cap < b.minCongestionWindow() {
 		cap = b.minCongestionWindow()
@@ -1721,10 +1742,10 @@ func (b *bbrv3Sender) logState(bytesInFlight protocol.ByteCount) {
 		bwSTKBps = float64(b.bwShortterm/BytesPerSecond) / 1024.0
 	}
 
-	fmt.Printf("[BBRv3] state=%-16s | bw=%8.1f KB/s  maxBw=%8.1f KB/s  minRTT=%6.1f ms | "+
+	fmt.Printf("[BBRv3 | CID: %s] state=%-16s | bw=%8.1f KB/s  maxBw=%8.1f KB/s  minRTT=%6.1f ms | "+
 		"BDP=%8d  cwnd=%8d  inflight=%8d  pacing=%8.1f KB/s | "+
 		"inflLT=%8d  inflST=%8d  bwST=%8.1f KB/s  round=%d\n",
-		state,
+		b.connLabel, state,
 		bwKBps, maxBwKBps, minRttMs,
 		bdpVal, b.congestionWindow, bytesInFlight, pacingKBps,
 		b.inflightLongterm, b.inflightShortterm, bwSTKBps, b.roundCount,

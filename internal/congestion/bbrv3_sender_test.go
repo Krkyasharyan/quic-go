@@ -52,6 +52,7 @@ func newTestBBRSender() *testBBRSender {
 		&utils.ConnectionStats{},
 		bbrTestMaxDatagramSize,
 		nil, // no qlogger
+		"test",
 	)
 	// Wire the delivery-rate estimator so BBR can call MarkConnectionAppLimited()
 	// during ProbeRTT (matching production wiring in sent_packet_handler).
@@ -121,7 +122,7 @@ func (s *testBBRSender) ackNPackets(n int, rtt time.Duration) {
 
 		if snap, ok := s.pktStates[s.ackedPacketNumber]; ok {
 			s.estimator.UpdateRateSample(
-				snap.state, snap.sendTime, bbrTestMaxDatagramSize, snap.bytesInFlight, s.clock.Now(),
+				snap.state, snap.sendTime, bbrTestMaxDatagramSize, snap.bytesInFlight, snap.lostAtSend, s.clock.Now(),
 			)
 			delete(s.pktStates, s.ackedPacketNumber)
 		}
@@ -138,7 +139,7 @@ func (s *testBBRSender) ackNPackets(n int, rtt time.Duration) {
 	}
 
 	// Phase 3: GenerateRateSample + feed to bandwidth consumer
-	sample := s.estimator.GenerateRateSample()
+	sample := s.estimator.GenerateRateSample(s.cumulativeLost)
 	if sample.DeliveryRate > 0 {
 		s.sender.OnBandwidthSample(sample)
 	}
@@ -983,8 +984,8 @@ func TestBBRv3AppLimitedSampleRejectedWhenBtlBwZero(t *testing.T) {
 	s.ackedPacketNumber++
 	snap := s.pktStates[s.ackedPacketNumber]
 	s.estimator.InitRateSample()
-	s.estimator.UpdateRateSample(snap.state, snap.sendTime, bbrTestMaxDatagramSize, snap.bytesInFlight, s.clock.Now())
-	sample := s.estimator.GenerateRateSample()
+	s.estimator.UpdateRateSample(snap.state, snap.sendTime, bbrTestMaxDatagramSize, snap.bytesInFlight, snap.lostAtSend, s.clock.Now())
+	sample := s.estimator.GenerateRateSample(s.cumulativeLost)
 	require.True(t, sample.IsAppLimited)
 	require.True(t, sample.DeliveryRate > 0)
 	delete(s.pktStates, s.ackedPacketNumber)
@@ -1022,8 +1023,8 @@ func TestBBRv3AppLimitedSampleAcceptedWhenExceedsBtlBw(t *testing.T) {
 	s.ackedPacketNumber++
 	snap := s.pktStates[s.ackedPacketNumber]
 	s.estimator.InitRateSample()
-	s.estimator.UpdateRateSample(snap.state, snap.sendTime, bbrTestMaxDatagramSize, snap.bytesInFlight, s.clock.Now())
-	sample := s.estimator.GenerateRateSample()
+	s.estimator.UpdateRateSample(snap.state, snap.sendTime, bbrTestMaxDatagramSize, snap.bytesInFlight, snap.lostAtSend, s.clock.Now())
+	sample := s.estimator.GenerateRateSample(s.cumulativeLost)
 	require.True(t, sample.IsAppLimited)
 	delete(s.pktStates, s.ackedPacketNumber)
 
@@ -1063,8 +1064,8 @@ func TestBBRv3StartupIgnoresAppLimitedRounds(t *testing.T) {
 		s.ackedPacketNumber++
 		snap := s.pktStates[s.ackedPacketNumber]
 		s.estimator.InitRateSample()
-		s.estimator.UpdateRateSample(snap.state, snap.sendTime, bbrTestMaxDatagramSize, snap.bytesInFlight, s.clock.Now())
-		sample := s.estimator.GenerateRateSample()
+		s.estimator.UpdateRateSample(snap.state, snap.sendTime, bbrTestMaxDatagramSize, snap.bytesInFlight, snap.lostAtSend, s.clock.Now())
+		sample := s.estimator.GenerateRateSample(s.cumulativeLost)
 		delete(s.pktStates, s.ackedPacketNumber)
 		s.sender.OnPacketAcked(s.ackedPacketNumber, bbrTestMaxDatagramSize, s.bytesInFlight, s.clock.Now())
 		s.bytesInFlight -= bbrTestMaxDatagramSize
@@ -1099,8 +1100,8 @@ func TestBBRv3BestSamplePrefersNonAppLimited(t *testing.T) {
 		s.ackedPacketNumber++
 		if snap, ok := s.pktStates[s.ackedPacketNumber]; ok {
 			s.estimator.InitRateSample()
-			s.estimator.UpdateRateSample(snap.state, snap.sendTime, bbrTestMaxDatagramSize, snap.bytesInFlight, s.clock.Now())
-			sample := s.estimator.GenerateRateSample()
+			s.estimator.UpdateRateSample(snap.state, snap.sendTime, bbrTestMaxDatagramSize, snap.bytesInFlight, snap.lostAtSend, s.clock.Now())
+			sample := s.estimator.GenerateRateSample(s.cumulativeLost)
 			samples = append(samples, sample)
 			delete(s.pktStates, s.ackedPacketNumber)
 		}
@@ -1151,8 +1152,8 @@ func TestBBRv3NormalOperationAfterAppLimitedPhase(t *testing.T) {
 		s.ackedPacketNumber++
 		if snap, ok := s.pktStates[s.ackedPacketNumber]; ok {
 			s.estimator.InitRateSample()
-			s.estimator.UpdateRateSample(snap.state, snap.sendTime, bbrTestMaxDatagramSize, snap.bytesInFlight, s.clock.Now())
-			sample := s.estimator.GenerateRateSample()
+			s.estimator.UpdateRateSample(snap.state, snap.sendTime, bbrTestMaxDatagramSize, snap.bytesInFlight, snap.lostAtSend, s.clock.Now())
+			sample := s.estimator.GenerateRateSample(s.cumulativeLost)
 			delete(s.pktStates, s.ackedPacketNumber)
 			s.sender.OnPacketAcked(s.ackedPacketNumber, bbrTestMaxDatagramSize, s.bytesInFlight, s.clock.Now())
 			s.bytesInFlight -= bbrTestMaxDatagramSize
@@ -1702,4 +1703,141 @@ func TestBBRv3IsExcessiveLossRoundUsesLossRate(t *testing.T) {
 	s.sender.bytesLostInRound = 2000
 	require.False(t, s.sender.isExcessiveLossRound(),
 		"exactly 2% loss rate should NOT be excessive (strict >)")
+}
+
+// ---------- Phase 6: inflST Spec-Compliance Tests ----------
+
+func TestBBRv3ACKPathRateSampleCarriesLost(t *testing.T) {
+	// Verify that the ACK-path RateSample (from GenerateRateSample) correctly
+	// computes RS.lost = C.lost - P.lost, enabling the ACK-path
+	// isInflightTooHigh check in adaptLongTermModel.
+	e := NewDeliveryRateEstimator()
+	now := monotime.Time(1_000_000_000)
+
+	// Send 5 packets. C.lost = 0 at send time for all.
+	type pkt struct {
+		state    PacketDeliveryState
+		sendTime monotime.Time
+	}
+	pkts := make([]pkt, 5)
+	var bif protocol.ByteCount
+	for i := range pkts {
+		pkts[i].state = e.OnPacketSent(now, bif)
+		pkts[i].sendTime = now
+		bif += testPacketSize
+		now += monotime.Time(time.Millisecond)
+	}
+
+	// Simulate: 2 packets were lost between send and ACK (cumulativeLost = 2*1200).
+	cumulativeLost := 2 * testPacketSize
+
+	// ACK packets 3-4 (the surviving ones). P.lost for these was 0 at send time.
+	ackTime := now + monotime.Time(50*time.Millisecond)
+	e.InitRateSample()
+	e.UpdateRateSample(pkts[2].state, pkts[2].sendTime, testPacketSize, 2*testPacketSize, 0, ackTime)
+	e.UpdateRateSample(pkts[3].state, pkts[3].sendTime, testPacketSize, 3*testPacketSize, 0, ackTime)
+	sample := e.GenerateRateSample(cumulativeLost)
+
+	// RS.lost should be cumulativeLost - P.lost_at_send_of_reference_pkt.
+	// Reference is pkt[3] (newest), P.lost = 0 → RS.lost = 2400 - 0 = 2400.
+	require.Equal(t, cumulativeLost, sample.PacketLost,
+		"RS.lost should equal cumulative lost minus reference packet's P.lost")
+	require.Greater(t, sample.TxInFlight, protocol.ByteCount(0),
+		"RS.tx_in_flight should be non-zero")
+}
+
+func TestBBRv3AdaptLongTermModelSetsInflightHiOnExcessiveLoss(t *testing.T) {
+	// Verify that adaptLongTermModel correctly detects excessive loss on the
+	// ACK-path sample and sets inflightLongterm (inflight_hi) via
+	// handleInflightTooHigh. This was the missing branch (Bug 2).
+	s := newTestBBRSender()
+	rtt := 100 * time.Millisecond
+
+	// Drive to ProbeBW UP (bwProbeSamples = 1 = armed).
+	s.driveToProbeBWPhase(probeBWUp, rtt)
+	require.Equal(t, probeBWUp, s.sender.ProbeBWPhaseValue())
+	require.Equal(t, 1, s.sender.bwProbeSamples, "bwProbeSamples should be armed in UP")
+
+	// Record state before loss.
+	require.Equal(t, protocol.ByteCount(0), s.sender.inflightLongterm,
+		"inflightLongterm should not yet be set if no excessive loss detected")
+
+	// Send a burst of packets to establish high tx_in_flight.
+	nSend := 0
+	for s.sender.CanSend(s.bytesInFlight) && nSend < 20 {
+		s.sendPacket()
+		nSend++
+	}
+	require.Greater(t, nSend, 0)
+
+	// Lose enough packets to exceed the 2% loss threshold.
+	// With 20 packets in flight at ~1280 bytes each = 25600 bytes,
+	// we need loss > 2% of tx_in_flight at send time.
+	// Lose 5 packets before ACKing to push cumulativeLost high.
+	nLoss := 5
+	s.loseNPackets(nLoss)
+
+	// Now ACK remaining packets. The RateSample will carry RS.lost > 0
+	// from the cumulativeLost accumulated above. If tx_in_flight * 0.02 < lost,
+	// isInflightTooHigh returns true → handleInflightTooHigh sets inflightLongterm.
+	s.clock.Advance(rtt)
+	remaining := nSend - nLoss
+	if remaining > 0 {
+		s.ackNPackets(remaining, rtt)
+	}
+
+	// inflightLongterm should now be set (non-zero) if the ACK-path
+	// isInflightTooHigh correctly fired.
+	require.Greater(t, s.sender.inflightLongterm, protocol.ByteCount(0),
+		"inflightLongterm should be set after excessive loss detected on ACK path")
+}
+
+func TestBBRv3BDPFailsafeWhenBothBoundsUninitialized(t *testing.T) {
+	// Verify that when both inflightLongterm == 0 and inflightShortterm == infMax,
+	// boundCwndForModel enforces a BDP-based cap (cwnd_gain * BDP).
+	s := newTestBBRSender()
+	rtt := 100 * time.Millisecond
+
+	// Drive to ProbeBW CRUISE so boundCwndForModel is active.
+	s.driveToState(bbrProbeBW, rtt)
+	require.Equal(t, bbrProbeBW, s.sender.Mode())
+
+	// Force both bounds to be uninitialized.
+	s.sender.inflightLongterm = 0
+	s.sender.inflightShortterm = infMax
+
+	// Inflate cwnd artificially to something much larger than BDP.
+	bdp := s.sender.bdp()
+	require.Greater(t, bdp, protocol.ByteCount(0), "BDP should be > 0")
+	hugeCwnd := bdp * 100
+	s.sender.congestionWindow = hugeCwnd
+
+	// Call boundCwndForModel — should cap cwnd at cwndGain * BDP.
+	s.sender.boundCwndForModel()
+
+	expectedCap := s.sender.bdpMultiple(s.sender.cwndGain)
+	require.LessOrEqual(t, s.sender.congestionWindow, expectedCap,
+		"cwnd should be capped at cwndGain * BDP when both bounds are uninitialized")
+	require.Less(t, s.sender.congestionWindow, hugeCwnd,
+		"cwnd should have been reduced from the inflated value")
+}
+
+func TestBBRv3BDPFailsafeNotAppliedInStartup(t *testing.T) {
+	// The BDP failsafe should NOT apply during Startup, because Startup
+	// intentionally grows cwnd without upper bounds.
+	s := newTestBBRSender()
+	require.Equal(t, bbrStartup, s.sender.Mode())
+
+	// Both bounds are uninitialized by default in Startup.
+	require.Equal(t, protocol.ByteCount(0), s.sender.inflightLongterm)
+	require.Equal(t, infMax, s.sender.inflightShortterm)
+
+	// Set a large cwnd manually.
+	largeCwnd := protocol.ByteCount(1_000_000)
+	s.sender.congestionWindow = largeCwnd
+
+	// boundCwndForModel should NOT cap it.
+	s.sender.boundCwndForModel()
+	require.Equal(t, largeCwnd, s.sender.congestionWindow,
+		"BDP failsafe must not apply during Startup")
 }
