@@ -529,6 +529,7 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 		rateSample.NewlyAcked = totalNewlyAcked
 		if bsc, ok := h.congestion.(congestion.BandwidthSampleConsumer); ok {
 			bsc.OnBandwidthSample(rateSample)
+			bsc.PostBandwidthSample()
 		}
 	}
 

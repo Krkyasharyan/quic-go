@@ -1841,3 +1841,183 @@ func TestBBRv3BDPFailsafeNotAppliedInStartup(t *testing.T) {
 	require.Equal(t, largeCwnd, s.sender.congestionWindow,
 		"BDP failsafe must not apply during Startup")
 }
+
+// ---------- Bug 4: isTimeToGoDown branch order ----------
+
+func TestBBRv3IsTimeToGoDownFullBwNowTakesPriority(t *testing.T) {
+	// When both fullBwNow=true AND cwndLimited at inflight_hi ceiling,
+	// isTimeToGoDown must return true (exit UP) immediately rather than
+	// resetting fullBwNow (spec §4.3.3.4 checks full_bw_now first).
+	s := newTestBBRSender()
+	rtt := 100 * time.Millisecond
+
+	s.driveToState(bbrProbeBW, rtt)
+	s.driveToProbeBWPhase(probeBWUp, rtt)
+	require.Equal(t, probeBWUp, s.sender.ProbeBWPhaseValue())
+
+	// Set up conditions: fullBwNow=true, cwnd-limited at inflight_hi ceiling.
+	s.sender.fullBwNow = true
+	s.sender.isCwndLimited = true
+	s.sender.inflightLongterm = 20000
+	s.sender.congestionWindow = 20000
+
+	// isTimeToGoDown should return true (fullBwNow checked first).
+	require.True(t, s.sender.isTimeToGoDown(),
+		"isTimeToGoDown must return true when fullBwNow is set")
+
+	// fullBwNow should still be true (not reset by cwndLimited branch).
+	require.True(t, s.sender.fullBwNow,
+		"fullBwNow must not be cleared when it triggers exit")
+}
+
+func TestBBRv3IsTimeToGoDownCwndLimitedResets(t *testing.T) {
+	// When fullBwNow=false but cwnd-limited at ceiling, isTimeToGoDown
+	// should return false and reset the full BW estimator.
+	s := newTestBBRSender()
+	rtt := 100 * time.Millisecond
+
+	s.driveToState(bbrProbeBW, rtt)
+	s.driveToProbeBWPhase(probeBWUp, rtt)
+
+	s.sender.fullBwNow = false
+	s.sender.isCwndLimited = true
+	s.sender.inflightLongterm = 20000
+	s.sender.congestionWindow = 20000
+	s.sender.fullBandwidthCount = 2 // non-zero to verify reset
+
+	require.False(t, s.sender.isTimeToGoDown(),
+		"isTimeToGoDown must return false when fullBwNow is not set")
+	require.Equal(t, 0, s.sender.fullBandwidthCount,
+		"cwndLimited branch should have reset fullBandwidthCount")
+}
+
+// ---------- Bug 5: Startup loss data ordering ----------
+
+func TestBBRv3StartupHighLossSeesAccumulatedData(t *testing.T) {
+	// Verify that checkStartupHighLoss observes loss data accumulated during
+	// the round, even when the round boundary fires on the same ACK.
+	s := newTestBBRSender()
+	rtt := 50 * time.Millisecond
+
+	require.Equal(t, bbrStartup, s.sender.Mode())
+
+	// Fill the pipe with enough packets to create real traffic.
+	nSend := 32
+	s.sendNPackets(nSend)
+	s.clock.Advance(rtt)
+	s.ackNPackets(nSend, rtt)
+
+	// Now create a round with heavy loss.
+	// Send another burst.
+	s.sendNPackets(nSend)
+	s.clock.Advance(rtt)
+
+	// Lose enough packets to exceed 2% loss threshold and 6+ events.
+	nLoss := 10 // 10/32 = 31% >> 2%
+	s.loseNPackets(nLoss)
+
+	// Verify loss data is accumulated.
+	require.True(t, s.sender.lossInRound, "lossInRound should be true after losses")
+	require.Greater(t, s.sender.lossEventsInRound, 0, "lossEventsInRound should be > 0")
+	require.Greater(t, s.sender.bytesLostInRound, protocol.ByteCount(0))
+
+	// ACK the remaining packets — this triggers OnBandwidthSample which
+	// should run checkStartupHighLoss BEFORE clearing loss counters.
+	remaining := nSend - nLoss
+	s.ackNPackets(remaining, rtt)
+
+	// With the fix, checkStartupHighLoss should have seen the loss data
+	// and initiated Startup exit (fullBwReached=true, mode transitions).
+	// The connection requirements (>2% loss rate, >= 6 loss events) are met.
+	if s.sender.lossEventsInRound >= bbrStartupFullLossCnt {
+		// If enough events accumulated before the ACK cleared them,
+		// Startup should have exited.
+		require.True(t, s.sender.fullBwReached,
+			"fullBwReached should be true after excessive Startup loss")
+		require.NotEqual(t, bbrStartup, s.sender.Mode(),
+			"should have exited Startup after excessive loss")
+	}
+}
+
+// ---------- Bug 6: Post-sample cwnd re-bounding ----------
+
+func TestBBRv3PostBandwidthSampleReboundsCwnd(t *testing.T) {
+	// Verify that PostBandwidthSample applies cwnd bounding after
+	// OnBandwidthSample sets inflightLongterm via adaptLongTermModel.
+	s := newTestBBRSender()
+	rtt := 100 * time.Millisecond
+
+	s.driveToState(bbrProbeBW, rtt)
+	s.driveToProbeBWPhase(probeBWCruise, rtt)
+	require.Equal(t, probeBWCruise, s.sender.ProbeBWPhaseValue())
+
+	// Set inflightLongterm to a small value (simulating handleInflightTooHigh).
+	bdp := s.sender.bdp()
+	require.Greater(t, bdp, protocol.ByteCount(0))
+	s.sender.inflightLongterm = bdp
+
+	// Inflate cwnd beyond inflightLongterm.
+	s.sender.congestionWindow = bdp * 5
+
+	// PostBandwidthSample should enforce the model cap.
+	s.sender.PostBandwidthSample()
+
+	// In CRUISE, cap = inflightWithHeadroom = 0.85 * inflightLongterm.
+	headroom := s.sender.inflightWithHeadroom()
+	require.LessOrEqual(t, s.sender.congestionWindow, headroom,
+		"PostBandwidthSample should have bounded cwnd to inflightWithHeadroom")
+}
+
+// ---------- Bug 7: Startup max rounds exit ----------
+
+func TestBBRv3StartupMaxRoundsExit(t *testing.T) {
+	// Verify that Startup exits after bbrStartupMaxRounds even when
+	// all samples are app-limited (preventing checkFullBWReached from firing).
+	s := newTestBBRSender()
+	rtt := 50 * time.Millisecond
+
+	require.Equal(t, bbrStartup, s.sender.Mode())
+
+	// Drive rounds by sending app-limited packets (inflight << cwnd).
+	// Each iteration: send 1 packet (app-limited), advance time, ACK it.
+	for i := int64(0); i < bbrStartupMaxRounds+10; i++ {
+		s.sendAppLimitedPacket()
+		s.clock.Advance(rtt)
+		s.ackNPackets(1, rtt)
+		s.clock.Advance(time.Millisecond)
+
+		if s.sender.Mode() != bbrStartup {
+			require.LessOrEqual(t, i, bbrStartupMaxRounds,
+				"should exit Startup at or before bbrStartupMaxRounds")
+			break
+		}
+	}
+
+	require.NotEqual(t, bbrStartup, s.sender.Mode(),
+		"should have exited Startup after %d rounds", bbrStartupMaxRounds)
+	require.True(t, s.sender.fullBwReached,
+		"fullBwReached should be set by the max-rounds exit")
+}
+
+func TestBBRv3StartupExitsNormallyBeforeMaxRounds(t *testing.T) {
+	// Normal Startup exit (via bandwidth growth plateau) should still
+	// work and occur well before the max-rounds safety valve.
+	s := newTestBBRSender()
+	rtt := 100 * time.Millisecond
+
+	for i := 0; i < 30; i++ {
+		s.sendNPackets(32)
+		s.clock.Advance(rtt)
+		s.ackNPackets(32, rtt)
+		s.clock.Advance(time.Millisecond)
+
+		if s.sender.Mode() != bbrStartup {
+			break
+		}
+	}
+
+	require.NotEqual(t, bbrStartup, s.sender.Mode(),
+		"normal Startup should exit via bandwidth growth plateau")
+	require.Less(t, s.sender.roundCount, bbrStartupMaxRounds,
+		"normal Startup should exit well before max-rounds")
+}

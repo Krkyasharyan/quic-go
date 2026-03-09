@@ -41,6 +41,11 @@ type RateSample struct {
 // SendAlgorithm so that controllers like Cubic are unaffected.
 type BandwidthSampleConsumer interface {
 	OnBandwidthSample(sample RateSample)
+	// PostBandwidthSample re-applies cwnd bounding after the bandwidth model
+	// has been updated. This ensures that model changes from OnBandwidthSample
+	// (e.g. inflightLongterm set by adaptLongTermModel) take effect on the
+	// same ACK rather than being delayed until the next ACK.
+	PostBandwidthSample()
 }
 
 // AppLimitedSetter allows a congestion controller to mark the connection as

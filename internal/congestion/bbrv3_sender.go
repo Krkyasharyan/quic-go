@@ -162,6 +162,10 @@ const (
 	// Non-spec: Drain timeout safety valve
 	bbrDrainTimeout = 3 * time.Second
 
+	// Non-spec safety: max rounds in Startup before forcing exit.
+	// Prevents app-limited connections from staying in Startup forever.
+	bbrStartupMaxRounds int64 = 100
+
 	// Default QUIC MTU
 	bbrDefaultMTU = 1200
 )
@@ -657,28 +661,19 @@ func (b *bbrv3Sender) OnBandwidthSample(sample RateSample) {
 	}
 
 	// --- Delivery-based round tracking (spec §5.5.1 BBRUpdateRound) ---
+	// Set round flag but defer clearing loss counters until after Startup
+	// checks, so checkStartupHighLoss sees accumulated loss data (Bug 5).
+	newRound := false
 	if sample.PriorDelivered >= b.nextRoundDelivered {
 		b.nextRoundDelivered = sample.Delivered
 		b.roundCount++
 		b.roundsSinceBWProbe++
 		b.newRoundSinceLastBwSample = true
-
-		// Per-round delivered tracking (for isExcessiveLossRound denominator).
-		b.deliveredAtRoundStart = b.lastDelivered
-		// Reset per-round loss counters for the NEW round.
-		// NOTE: lossInRound is NOT reset here; it is reset in the
-		// lossRoundStart block below, after adaptLowerBoundsFromCongestion
-		// has had a chance to observe it (spec §5.5.10.3).
-		b.bytesLostInRound = 0
-		b.lossEventsInRound = 0
+		newRound = true
 	}
 
-	// --- Update congestion signals (spec §5.5.10.3 BBRUpdateCongestionSignals) ---
+	// --- Update congestion signals (spec §5.5.10.3 — partial: updateMaxBw only) ---
 	b.updateMaxBw(sample)
-	if b.lossRoundStart {
-		b.adaptLowerBoundsFromCongestion()
-		b.lossInRound = false
-	}
 
 	// --- Update ACK aggregation (spec §5.5.9) ---
 	b.updateACKAggregation(sample)
@@ -687,11 +682,31 @@ func (b *bbrv3Sender) OnBandwidthSample(sample RateSample) {
 	b.checkFullBWReached(sample)
 
 	// --- Check Startup done (spec §5.3.1 BBRCheckStartupDone) ---
+	// Runs BEFORE loss counters are cleared so checkStartupHighLoss
+	// can observe the accumulated loss data from the completed round.
 	if b.mode == bbrStartup {
 		b.checkStartupHighLoss(sample)
+		// Safety: exit Startup after bbrStartupMaxRounds even if
+		// all samples are app-limited (prevents infinite Startup).
+		if b.roundCount >= bbrStartupMaxRounds {
+			b.fullBwReached = true
+		}
 		if b.mode == bbrStartup && b.fullBwReached {
 			b.enterDrain()
 		}
+	}
+
+	// --- Clear per-round loss counters for the NEW round ---
+	if newRound {
+		b.deliveredAtRoundStart = b.lastDelivered
+		b.bytesLostInRound = 0
+		b.lossEventsInRound = 0
+	}
+
+	// --- Congestion signal clearing (spec §5.5.10.3 — deferred) ---
+	if b.lossRoundStart {
+		b.adaptLowerBoundsFromCongestion()
+		b.lossInRound = false
 	}
 
 	// --- Adapt long-term model (spec §5.3.3.6 BBRAdaptLongTermModel) ---
@@ -708,6 +723,14 @@ func (b *bbrv3Sender) OnBandwidthSample(sample RateSample) {
 	b.boundBWForModel()
 
 	b.newRoundSinceLastBwSample = false
+}
+
+// PostBandwidthSample re-applies cwnd bounding after OnBandwidthSample has
+// updated the bandwidth model. This corrects the model-after-control ordering:
+// OnPacketAcked runs setCwnd before OnBandwidthSample updates inflightLongterm
+// via adaptLongTermModel, so we re-bound here to apply the update immediately.
+func (b *bbrv3Sender) PostBandwidthSample() {
+	b.boundCwndForModel()
 }
 
 // updateMaxBw implements spec §5.5.5 BBRUpdateMaxBw.
@@ -1277,13 +1300,15 @@ func (b *bbrv3Sender) isTimeToCruise(bytesInFlight protocol.ByteCount) bool {
 }
 
 // isTimeToGoDown: spec §5.3.3.4 BBRIsTimeToGoDown.
+// Check full_bw_now FIRST (spec ordering), before the cwnd-limited reset.
 func (b *bbrv3Sender) isTimeToGoDown() bool {
+	if b.fullBwNow {
+		return true
+	}
 	if b.isCwndLimited && b.inflightLongterm > 0 && b.congestionWindow >= b.inflightLongterm {
 		// BW is limited by inflight_longterm; reset full_bw estimator.
 		b.resetFullBW()
 		b.fullBandwidth = b.bw
-	} else if b.fullBwNow {
-		return true
 	}
 	return false
 }
