@@ -576,6 +576,18 @@ func (b *bbrv3Sender) GetCongestionWindow() protocol.ByteCount {
 	return b.congestionWindow
 }
 
+// FillSnapshot writes BBRv3-specific fields into the telemetry snapshot.
+// Zero-alloc: all writes are primitive-to-primitive register MOVs.
+func (b *bbrv3Sender) FillSnapshot(snap *CongestionSnapshot) {
+	snap.CongestionWindow = uint64(b.congestionWindow)
+	snap.MaxBw = uint64(b.maxBw)
+	snap.PacingRate = uint64(b.PacingRate())
+	snap.SlowStartThreshold = 0
+	snap.BBRMode = uint8(b.mode)
+	snap.ProbeBWPhase = uint8(b.probeBWPhase)
+	snap.Algorithm = AlgoBBRv3
+}
+
 // ---------- Pacing Rate (spec §5.6.2) ----------
 
 // pacingRateBytesPerSec returns the pacing rate in bytes/sec for the pacer callback.

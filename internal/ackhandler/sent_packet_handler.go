@@ -115,9 +115,33 @@ type sentPacketHandler struct {
 	qlogger     qlogwriter.Recorder
 	lastMetrics qlog.MetricsUpdated
 	logger      utils.Logger
+
+	// Lock-free congestion telemetry snapshot (SeqLock).
+	// Must be last to ensure cache-line isolation from hot fields above.
+	ccSeqLock congestion.CongestionSeqLock
 }
 
 var _ SentPacketHandler = &sentPacketHandler{}
+
+// publishSnapshot writes a consistent congestion telemetry snapshot via the
+// SeqLock. Called from the run-loop goroutine only (single-producer).
+// Zero heap allocations: all writes are primitive field stores.
+func (h *sentPacketHandler) publishSnapshot() {
+	sl := &h.ccSeqLock
+	sl.BeginWrite()
+	snap := sl.Snap()
+	h.congestion.FillSnapshot(snap)
+	snap.BytesInFlight = uint64(h.bytesInFlight)
+	snap.SmoothedRTT = h.rttStats.SmoothedRTTRaw()
+	snap.MinRTT = h.rttStats.MinRTTRaw()
+	sl.EndWrite()
+}
+
+// GetCongestionSnapshot copies the latest telemetry snapshot into dst via a
+// lock-free SeqLock read. Safe to call from any goroutine.
+func (h *sentPacketHandler) GetCongestionSnapshot(dst *congestion.CongestionSnapshot) bool {
+	return h.ccSeqLock.ReadSnapshot(dst)
+}
 
 // clientAddressValidated indicates whether the address was validated beforehand by an address validation token.
 // If the address was validated, the amplification limit doesn't apply. It has no effect for a client.
@@ -312,6 +336,7 @@ func (h *sentPacketHandler) SentPacket(
 		if h.numProbesToSend > 0 {
 			h.numProbesToSend--
 		}
+		h.publishSnapshot()
 	}
 
 	// Snapshot delivery-rate state into the packet for later rate estimation.
@@ -563,6 +588,7 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 	}
 
 	h.setLossDetectionTimer(rcvTime)
+	h.publishSnapshot()
 	return acked1RTTPacket, nil
 }
 
@@ -971,6 +997,7 @@ func (h *sentPacketHandler) OnLossDetectionTimeout(now monotime.Time) error {
 		}
 		// Early retransmit or time loss detection
 		h.detectLostPackets(now, encLevel)
+		h.publishSnapshot()
 		return nil
 	}
 

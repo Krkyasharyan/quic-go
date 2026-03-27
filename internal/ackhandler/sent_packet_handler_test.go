@@ -1077,6 +1077,7 @@ func TestSentPacketHandlerCongestion(t *testing.T) {
 	mockCtrl := gomock.NewController(t)
 	cong := mocks.NewMockSendAlgorithmWithDebugInfos(mockCtrl)
 	cong.EXPECT().GetCongestionWindow().Return(protocol.ByteCount(100000)).AnyTimes()
+	cong.EXPECT().FillSnapshot(gomock.Any()).AnyTimes()
 	rttStats := utils.NewRTTStats()
 	sph := NewSentPacketHandler(
 		0,
@@ -1282,6 +1283,7 @@ func TestSentPacketHandlerECN(t *testing.T) {
 	cong.EXPECT().OnPacketAcked(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
 	cong.EXPECT().MaybeExitSlowStart().AnyTimes()
 	cong.EXPECT().GetCongestionWindow().Return(protocol.ByteCount(100000)).AnyTimes()
+	cong.EXPECT().FillSnapshot(gomock.Any()).AnyTimes()
 	ecnHandler := NewMockECNHandler(mockCtrl)
 	sph := NewSentPacketHandler(
 		0,

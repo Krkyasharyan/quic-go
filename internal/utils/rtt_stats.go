@@ -60,6 +60,13 @@ func (r *RTTStats) MeanDeviation() time.Duration {
 	return time.Duration(r.meanDeviation.Load())
 }
 
+// SmoothedRTTRaw returns the smoothed RTT as raw int64 nanoseconds.
+// Used by the telemetry SeqLock to avoid time.Duration casts on the hot path.
+func (r *RTTStats) SmoothedRTTRaw() int64 { return r.smoothedRTT.Load() }
+
+// MinRTTRaw returns the minimum RTT as raw int64 nanoseconds.
+func (r *RTTStats) MinRTTRaw() int64 { return r.minRTT.Load() }
+
 // MaxAckDelay gets the max_ack_delay advertised by the peer
 func (r *RTTStats) MaxAckDelay() time.Duration {
 	return time.Duration(r.maxAckDelay.Load())

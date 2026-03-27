@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go/internal/ackhandler"
+	"github.com/quic-go/quic-go/internal/congestion"
 	"github.com/quic-go/quic-go/internal/flowcontrol"
 	"github.com/quic-go/quic-go/internal/handshake"
 	"github.com/quic-go/quic-go/internal/monotime"
@@ -845,6 +846,47 @@ func (c *Conn) ConnectionStats() ConnectionStats {
 		BytesLost:       c.connStats.BytesLost.Load(),
 		PacketsLost:     c.connStats.PacketsLost.Load(),
 	}
+}
+
+// CongestionStats contains a snapshot of congestion controller telemetry.
+// All fields are fixed-size primitives for zero-allocation polling.
+type CongestionStats struct {
+	CongestionWindow   uint64 // bytes
+	BytesInFlight      uint64 // bytes
+	MaxBandwidth       uint64 // bits per second (BBRv3 max_bw; 0 for CUBIC)
+	PacingRate         uint64 // bits per second (BBRv3; 0 for CUBIC)
+	SlowStartThreshold uint64 // bytes (CUBIC ssthresh; 0 for BBRv3)
+	SmoothedRTT        int64  // nanoseconds
+	MinRTT             int64  // nanoseconds
+	PacketsLost        uint64 // cumulative
+	BytesLost          uint64 // cumulative
+	BBRMode            uint8  // 0=Startup,1=Drain,2=ProbeBW,3=ProbeRTT,0xFF=N/A
+	ProbeBWPhase       uint8  // 0=DOWN,1=CRUISE,2=REFILL,3=UP,0xFF=N/A
+	Algorithm          uint8  // 0=BBRv3, 1=CUBIC
+}
+
+// GetCongestionStats returns a lock-free snapshot of congestion controller
+// state. Safe to call from any goroutine at any time. Returns ok=false if
+// the writer was active during all read attempts (retry on next poll cycle).
+func (c *Conn) GetCongestionStats() (stats CongestionStats, ok bool) {
+	var snap congestion.CongestionSnapshot
+	if !c.sentPacketHandler.GetCongestionSnapshot(&snap) {
+		return CongestionStats{}, false
+	}
+	return CongestionStats{
+		CongestionWindow:   snap.CongestionWindow,
+		BytesInFlight:      snap.BytesInFlight,
+		MaxBandwidth:       snap.MaxBw,
+		PacingRate:         snap.PacingRate,
+		SlowStartThreshold: snap.SlowStartThreshold,
+		SmoothedRTT:        snap.SmoothedRTT,
+		MinRTT:             snap.MinRTT,
+		PacketsLost:        c.connStats.PacketsLost.Load(),
+		BytesLost:          c.connStats.BytesLost.Load(),
+		BBRMode:            snap.BBRMode,
+		ProbeBWPhase:       snap.ProbeBWPhase,
+		Algorithm:          snap.Algorithm,
+	}, true
 }
 
 // Time when the connection should time out

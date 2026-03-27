@@ -13,6 +13,7 @@ import (
 	reflect "reflect"
 
 	ackhandler "github.com/quic-go/quic-go/internal/ackhandler"
+	congestion "github.com/quic-go/quic-go/internal/congestion"
 	monotime "github.com/quic-go/quic-go/internal/monotime"
 	protocol "github.com/quic-go/quic-go/internal/protocol"
 	wire "github.com/quic-go/quic-go/internal/wire"
@@ -671,6 +672,44 @@ func (c *MockSentPacketHandlerTimeUntilSendCall) Do(f func() monotime.Time) *Moc
 
 // DoAndReturn rewrite *gomock.Call.DoAndReturn
 func (c *MockSentPacketHandlerTimeUntilSendCall) DoAndReturn(f func() monotime.Time) *MockSentPacketHandlerTimeUntilSendCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}
+
+// GetCongestionSnapshot mocks base method.
+func (m *MockSentPacketHandler) GetCongestionSnapshot(dst *congestion.CongestionSnapshot) bool {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetCongestionSnapshot", dst)
+	ret0, _ := ret[0].(bool)
+	return ret0
+}
+
+// GetCongestionSnapshot indicates an expected call of GetCongestionSnapshot.
+func (mr *MockSentPacketHandlerMockRecorder) GetCongestionSnapshot(dst any) *MockSentPacketHandlerGetCongestionSnapshotCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetCongestionSnapshot", reflect.TypeOf((*MockSentPacketHandler)(nil).GetCongestionSnapshot), dst)
+	return &MockSentPacketHandlerGetCongestionSnapshotCall{Call: call}
+}
+
+// MockSentPacketHandlerGetCongestionSnapshotCall wrap *gomock.Call
+type MockSentPacketHandlerGetCongestionSnapshotCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockSentPacketHandlerGetCongestionSnapshotCall) Return(arg0 bool) *MockSentPacketHandlerGetCongestionSnapshotCall {
+	c.Call = c.Call.Return(arg0)
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockSentPacketHandlerGetCongestionSnapshotCall) Do(f func(*congestion.CongestionSnapshot) bool) *MockSentPacketHandlerGetCongestionSnapshotCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockSentPacketHandlerGetCongestionSnapshotCall) DoAndReturn(f func(*congestion.CongestionSnapshot) bool) *MockSentPacketHandlerGetCongestionSnapshotCall {
 	c.Call = c.Call.DoAndReturn(f)
 	return c
 }

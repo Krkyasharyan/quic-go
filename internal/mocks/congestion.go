@@ -12,6 +12,7 @@ package mocks
 import (
 	reflect "reflect"
 
+	congestion "github.com/quic-go/quic-go/internal/congestion"
 	monotime "github.com/quic-go/quic-go/internal/monotime"
 	protocol "github.com/quic-go/quic-go/internal/protocol"
 	gomock "go.uber.org/mock/gomock"
@@ -481,6 +482,42 @@ func (c *MockSendAlgorithmWithDebugInfosTimeUntilSendCall) Do(f func(protocol.By
 
 // DoAndReturn rewrite *gomock.Call.DoAndReturn
 func (c *MockSendAlgorithmWithDebugInfosTimeUntilSendCall) DoAndReturn(f func(protocol.ByteCount) monotime.Time) *MockSendAlgorithmWithDebugInfosTimeUntilSendCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}
+
+// FillSnapshot mocks base method.
+func (m *MockSendAlgorithmWithDebugInfos) FillSnapshot(snap *congestion.CongestionSnapshot) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "FillSnapshot", snap)
+}
+
+// FillSnapshot indicates an expected call of FillSnapshot.
+func (mr *MockSendAlgorithmWithDebugInfosMockRecorder) FillSnapshot(snap any) *MockSendAlgorithmWithDebugInfosFillSnapshotCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "FillSnapshot", reflect.TypeOf((*MockSendAlgorithmWithDebugInfos)(nil).FillSnapshot), snap)
+	return &MockSendAlgorithmWithDebugInfosFillSnapshotCall{Call: call}
+}
+
+// MockSendAlgorithmWithDebugInfosFillSnapshotCall wrap *gomock.Call
+type MockSendAlgorithmWithDebugInfosFillSnapshotCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockSendAlgorithmWithDebugInfosFillSnapshotCall) Return() *MockSendAlgorithmWithDebugInfosFillSnapshotCall {
+	c.Call = c.Call.Return()
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockSendAlgorithmWithDebugInfosFillSnapshotCall) Do(f func(*congestion.CongestionSnapshot)) *MockSendAlgorithmWithDebugInfosFillSnapshotCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockSendAlgorithmWithDebugInfosFillSnapshotCall) DoAndReturn(f func(*congestion.CongestionSnapshot)) *MockSendAlgorithmWithDebugInfosFillSnapshotCall {
 	c.Call = c.Call.DoAndReturn(f)
 	return c
 }

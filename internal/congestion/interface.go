@@ -24,6 +24,9 @@ type SendAlgorithmWithDebugInfos interface {
 	InSlowStart() bool
 	InRecovery() bool
 	GetCongestionWindow() protocol.ByteCount
+	// FillSnapshot writes the CC-specific fields into snap.
+	// Called by the SeqLock writer on the hot path — must be zero-alloc.
+	FillSnapshot(snap *CongestionSnapshot)
 }
 
 // ECNCongestionConsumer is optionally implemented by congestion controllers

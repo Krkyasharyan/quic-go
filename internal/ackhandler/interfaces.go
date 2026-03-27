@@ -1,6 +1,7 @@
 package ackhandler
 
 import (
+	"github.com/quic-go/quic-go/internal/congestion"
 	"github.com/quic-go/quic-go/internal/monotime"
 	"github.com/quic-go/quic-go/internal/protocol"
 	"github.com/quic-go/quic-go/internal/wire"
@@ -41,4 +42,9 @@ type SentPacketHandler interface {
 	OnLossDetectionTimeout(now monotime.Time) error
 
 	MigratedPath(now monotime.Time, initialMaxPacketSize protocol.ByteCount)
+
+	// GetCongestionSnapshot copies the latest congestion telemetry snapshot
+	// into dst via a lock-free SeqLock read. Returns true if a consistent
+	// (non-torn) read was obtained.
+	GetCongestionSnapshot(dst *congestion.CongestionSnapshot) bool
 }

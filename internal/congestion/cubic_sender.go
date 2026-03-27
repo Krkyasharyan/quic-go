@@ -171,6 +171,18 @@ func (c *cubicSender) GetCongestionWindow() protocol.ByteCount {
 	return c.congestionWindow
 }
 
+// FillSnapshot writes CUBIC-specific fields into the telemetry snapshot.
+// Zero-alloc: all writes are primitive-to-primitive register MOVs.
+func (c *cubicSender) FillSnapshot(snap *CongestionSnapshot) {
+	snap.CongestionWindow = uint64(c.congestionWindow)
+	snap.MaxBw = 0
+	snap.PacingRate = 0
+	snap.SlowStartThreshold = uint64(c.slowStartThreshold)
+	snap.BBRMode = BBRModeNA
+	snap.ProbeBWPhase = ProbeBWPhaseNA
+	snap.Algorithm = AlgoCubic
+}
+
 func (c *cubicSender) MaybeExitSlowStart() {
 	if c.InSlowStart() &&
 		c.hybridSlowStart.ShouldExitSlowStart(c.rttStats.LatestRTT(), c.rttStats.MinRTT(), c.GetCongestionWindow()/c.maxDatagramSize) {
