@@ -35,7 +35,7 @@ func TestSeqLockReadWriteConsistency(t *testing.T) {
 	snap.PacingRate = 400000
 	snap.SlowStartThreshold = 0
 	snap.SmoothedRTT = 50_000_000 // 50ms
-	snap.MinRTT = 10_000_000     // 10ms
+	snap.MinRTT = 10_000_000      // 10ms
 	snap.BBRMode = BBRModeProbeBW
 	snap.ProbeBWPhase = ProbeBWPhaseCruise
 	snap.Algorithm = AlgoBBRv3
@@ -279,8 +279,8 @@ func newSnapshotBBRv3Sender() *bbrv3Sender {
 
 func newSnapshotCubicSender() *cubicSender {
 	return &cubicSender{
-		maxDatagramSize:     1200,
-		congestionWindow:    32 * 1200,
+		maxDatagramSize:    1200,
+		congestionWindow:   32 * 1200,
 		slowStartThreshold: protocol.MaxByteCount,
 	}
 }

@@ -18,9 +18,9 @@ import (
 // writer's counter-store does not invalidate the reader's data-read.
 type CongestionSeqLock struct {
 	seq   atomic.Uint64
-	_pad0 [56]byte             // isolate seq on its own cache line
-	snap  CongestionSnapshot   // exactly 64 bytes — its own cache line
-	_pad1 [64]byte             // prevent false sharing with adjacent struct fields
+	_pad0 [56]byte           // isolate seq on its own cache line
+	snap  CongestionSnapshot // exactly 64 bytes — its own cache line
+	_pad1 [64]byte           // prevent false sharing with adjacent struct fields
 }
 
 // BeginWrite marks the start of a write. The caller MUST call EndWrite after
