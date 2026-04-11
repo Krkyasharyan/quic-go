@@ -483,7 +483,7 @@ func (b *bbrv3Sender) OnPacketAcked(
 	b.setCwnd()
 
 	// 6. Diagnostic telemetry.
-	b.logState(priorInFlight)
+	// b.logState(priorInFlight)
 }
 
 // OnCongestionEvent: called per lost packet. Spec §5.2.4.
